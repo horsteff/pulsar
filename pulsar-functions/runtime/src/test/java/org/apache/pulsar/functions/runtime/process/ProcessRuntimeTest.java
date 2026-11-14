@@ -1,4 +1,4 @@
-/**
+/*
  * Licensed to the Apache Software Foundation (ASF) under one
  * or more contributor license agreements.  See the NOTICE file
  * distributed with this work for additional information
@@ -16,18 +16,16 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-
 package org.apache.pulsar.functions.runtime.process;
 
 import static org.apache.pulsar.functions.runtime.RuntimeUtils.FUNCTIONS_INSTANCE_CLASSPATH;
 import static org.testng.Assert.assertEquals;
 import static org.testng.Assert.assertTrue;
-
+import com.fasterxml.jackson.databind.ObjectMapper;
 import com.google.common.io.MoreFiles;
 import com.google.common.io.RecursiveDeleteOption;
 import com.google.gson.reflect.TypeToken;
-import com.google.protobuf.util.JsonFormat;
-
+import io.kubernetes.client.openapi.models.V1PodSpec;
 import java.lang.reflect.Type;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -36,21 +34,23 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
-
-import io.kubernetes.client.openapi.apis.AppsV1Api;
-import io.kubernetes.client.openapi.apis.CoreV1Api;
-import io.kubernetes.client.openapi.models.V1PodSpec;
+import org.apache.commons.lang3.JavaVersion;
+import org.apache.commons.lang3.SystemUtils;
 import org.apache.pulsar.common.util.ObjectMapperFactory;
+import org.apache.pulsar.functions.instance.AuthenticationConfig;
 import org.apache.pulsar.functions.instance.InstanceConfig;
-import org.apache.pulsar.functions.proto.Function;
-import org.apache.pulsar.functions.proto.Function.ConsumerSpec;
-import org.apache.pulsar.functions.proto.Function.FunctionDetails;
+import org.apache.pulsar.functions.proto.ConsumerSpec;
+import org.apache.pulsar.functions.proto.FunctionDetails;
+import org.apache.pulsar.functions.proto.SourceSpec;
+import org.apache.pulsar.functions.proto.SubscriptionType;
 import org.apache.pulsar.functions.runtime.thread.ThreadRuntime;
 import org.apache.pulsar.functions.secretsprovider.ClearTextSecretsProvider;
 import org.apache.pulsar.functions.secretsproviderconfigurator.SecretsProviderConfigurator;
 import org.apache.pulsar.functions.utils.FunctionCommon;
 import org.apache.pulsar.functions.worker.ConnectorsManager;
+import org.apache.pulsar.functions.worker.FunctionsManager;
 import org.apache.pulsar.functions.worker.WorkerConfig;
+import org.mockito.MockedStatic;
 import org.mockito.Mockito;
 import org.testng.annotations.AfterMethod;
 import org.testng.annotations.BeforeClass;
@@ -64,11 +64,6 @@ public class ProcessRuntimeTest {
     private String defaultWebServiceUrl = "http://localhost:8080";
 
     class TestSecretsProviderConfigurator implements SecretsProviderConfigurator {
-
-        @Override
-        public void init(Map<String, String> config) {
-
-        }
 
         @Override
         public String getSecretsProviderClassName(FunctionDetails functionDetails) {
@@ -87,11 +82,13 @@ public class ProcessRuntimeTest {
         }
 
         @Override
-        public void configureKubernetesRuntimeSecretsProvider(V1PodSpec podSpec, String functionsContainerName, FunctionDetails functionDetails) {
+        public void configureKubernetesRuntimeSecretsProvider(V1PodSpec podSpec, String functionsContainerName,
+                                                              FunctionDetails functionDetails) {
         }
 
         @Override
-        public void configureProcessRuntimeSecretsProvider(ProcessBuilder processBuilder, FunctionDetails functionDetails) {
+        public void configureProcessRuntimeSecretsProvider(ProcessBuilder processBuilder,
+                                                           FunctionDetails functionDetails) {
         }
 
         @Override
@@ -99,10 +96,6 @@ public class ProcessRuntimeTest {
             return TypeToken.get(String.class).getType();
         }
 
-        @Override
-        public void doAdmissionChecks(AppsV1Api appsV1Api, CoreV1Api coreV1Api, String jobNamespace, String jobName, FunctionDetails functionDetails) {
-
-        }
     }
 
     private static final String TEST_TENANT = "test-function-tenant";
@@ -111,9 +104,9 @@ public class ProcessRuntimeTest {
     private static final Map<String, String> topicsToSerDeClassName = new HashMap<>();
     private static final Map<String, ConsumerSpec> topicsToSchema = new HashMap<>();
     static {
-        topicsToSerDeClassName.put("persistent://sample/standalone/ns1/test_src", "");
-        topicsToSchema.put("persistent://sample/standalone/ns1/test_src",
-                ConsumerSpec.newBuilder().setSerdeClassName("").setIsRegexPattern(false).build());
+        topicsToSerDeClassName.put("test_src", "");
+        ConsumerSpec consumerSpec = new ConsumerSpec().setSerdeClassName("").setIsRegexPattern(false);
+        topicsToSchema.put("test_src", consumerSpec);
     }
 
     private ProcessRuntimeFactory factory;
@@ -146,11 +139,13 @@ public class ProcessRuntimeTest {
     }
 
     private ProcessRuntimeFactory createProcessRuntimeFactory(String extraDependenciesDir) {
-        return createProcessRuntimeFactory(extraDependenciesDir, null, false);
+        return createProcessRuntimeFactory(extraDependenciesDir, null, false, null);
     }
 
+    @SuppressWarnings("unchecked")
     private ProcessRuntimeFactory createProcessRuntimeFactory(String extraDependenciesDir, String webServiceUrl,
-                                                              boolean exposePulsarAdminClientEnabled) {
+                                                              boolean exposePulsarAdminClientEnabled,
+                                                              AuthenticationConfig authConfig) {
         ProcessRuntimeFactory processRuntimeFactory = new ProcessRuntimeFactory();
 
         WorkerConfig workerConfig = new WorkerConfig();
@@ -171,32 +166,35 @@ public class ProcessRuntimeTest {
 
         workerConfig.setFunctionRuntimeFactoryClassName(ProcessRuntimeFactory.class.getName());
         workerConfig.setFunctionRuntimeFactoryConfigs(
-                ObjectMapperFactory.getThreadLocal().convertValue(processRuntimeFactoryConfig, Map.class));
-        processRuntimeFactory.initialize(workerConfig, null, new TestSecretsProviderConfigurator(), Mockito.mock(ConnectorsManager.class), Optional.empty(), Optional.empty());
+                ObjectMapperFactory.getMapper().getObjectMapper().convertValue(processRuntimeFactoryConfig, Map.class));
+        processRuntimeFactory.initialize(workerConfig, authConfig, new TestSecretsProviderConfigurator(),
+                Mockito.mock(ConnectorsManager.class), Mockito.mock(FunctionsManager.class), Optional.empty(),
+                Optional.empty());
 
         return processRuntimeFactory;
     }
 
     FunctionDetails createFunctionDetails(FunctionDetails.Runtime runtime) {
-        FunctionDetails.Builder functionDetailsBuilder = FunctionDetails.newBuilder();
-        functionDetailsBuilder.setRuntime(runtime);
-        functionDetailsBuilder.setTenant(TEST_TENANT);
-        functionDetailsBuilder.setNamespace(TEST_NAMESPACE);
-        functionDetailsBuilder.setName(TEST_NAME);
-        functionDetailsBuilder.setClassName("org.apache.pulsar.functions.utils.functioncache.AddFunction");
-        functionDetailsBuilder.setSink(Function.SinkSpec.newBuilder()
+        FunctionDetails functionDetails = new FunctionDetails();
+        functionDetails.setRuntime(runtime);
+        functionDetails.setTenant(TEST_TENANT);
+        functionDetails.setNamespace(TEST_NAMESPACE);
+        functionDetails.setName(TEST_NAME);
+        functionDetails.setClassName("org.apache.pulsar.functions.utils.functioncache.AddFunction");
+        functionDetails.setSink()
                 .setTopic(TEST_NAME + "-output")
                 .setSerDeClassName("org.apache.pulsar.functions.runtime.serde.Utf8Serializer")
                 .setClassName("org.pulsar.pulsar.TestSink")
-                .setTypeClassName(String.class.getName())
-                .build());
-        functionDetailsBuilder.setLogTopic(TEST_NAME + "-log");
-        functionDetailsBuilder.setSource(Function.SourceSpec.newBuilder()
-                .setSubscriptionType(Function.SubscriptionType.FAILOVER)
-                .putAllInputSpecs(topicsToSchema)
+                .setTypeClassName(String.class.getName());
+        functionDetails.setLogTopic(TEST_NAME + "-log");
+        SourceSpec sourceSpec = functionDetails.setSource();
+        sourceSpec.setSubscriptionType(SubscriptionType.FAILOVER)
                 .setClassName("org.pulsar.pulsar.TestSource")
-                .setTypeClassName(String.class.getName()));
-        return functionDetailsBuilder.build();
+                .setTypeClassName(String.class.getName());
+        for (Map.Entry<String, ConsumerSpec> entry : topicsToSchema.entrySet()) {
+            sourceSpec.putInputSpecs(entry.getKey()).copyFrom(entry.getValue());
+        }
+        return functionDetails;
     }
 
     InstanceConfig createJavaInstanceConfig(FunctionDetails.Runtime runtime) {
@@ -291,51 +289,71 @@ public class ProcessRuntimeTest {
     }
 
     private void verifyJavaInstance(InstanceConfig config, Path depsDir, String webServiceUrl) throws Exception {
-        ProcessRuntime container = factory.createContainer(config, userJarFile, null, 30l);
-        List<String> args = container.getProcessArgs();
+        List<String> args;
+        try (MockedStatic<SystemUtils> systemUtils = Mockito.mockStatic(SystemUtils.class,
+                Mockito.CALLS_REAL_METHODS)) {
+            systemUtils.when(() -> SystemUtils.isJavaVersionAtLeast(JavaVersion.JAVA_9)).thenReturn(true);
+            ProcessRuntime container = factory.createContainer(config, userJarFile, userJarFile,
+                    userJarFile, userJarFile, 30L);
+            args = container.getProcessArgs();
+        }
 
         String classpath = javaInstanceJarFile;
         String extraDepsEnv;
         int portArg;
         int metricsPortArg;
-        int totalArgCount = 41;
+        int totalArgCount = 56;
         if (webServiceUrl != null && config.isExposePulsarAdminClientEnabled()) {
             totalArgCount += 3;
         }
         if (null != depsDir) {
             assertEquals(args.size(), totalArgCount);
-            extraDepsEnv = " -Dpulsar.functions.extra.dependencies.dir=" + depsDir.toString();
+            extraDepsEnv = " -Dpulsar.functions.extra.dependencies.dir=" + depsDir;
             classpath = classpath + ":" + depsDir + "/*";
-            portArg = 24;
-            metricsPortArg = 26;
+            portArg = 39;
+            metricsPortArg = 41;
         } else {
-            assertEquals(args.size(), totalArgCount-1);
+            assertEquals(args.size(), totalArgCount - 1);
             extraDepsEnv = "";
-            portArg = 23;
-            metricsPortArg = 25;
+            portArg = 38;
+            metricsPortArg = 40;
         }
         if (webServiceUrl != null && config.isExposePulsarAdminClientEnabled()) {
             portArg += 3;
             metricsPortArg += 3;
         }
 
-        String pulsarAdminArg = webServiceUrl != null && config.isExposePulsarAdminClientEnabled() ?
-                " --web_serviceurl " + webServiceUrl + " --expose_pulsaradmin" : "";
+        String pulsarAdminArg = webServiceUrl != null && config.isExposePulsarAdminClientEnabled()
+                ? " --web_serviceurl " + webServiceUrl + " --expose_pulsaradmin" : "";
 
         String expectedArgs = "java -cp " + classpath
                 + extraDepsEnv
                 + " -Dpulsar.functions.instance.classpath=/pulsar/lib/*"
-                + " -Dlog4j.configurationFile=java_instance_log4j2.xml "
-                + "-Dpulsar.function.log.dir=" + logDirectory + "/functions/" + FunctionCommon.getFullyQualifiedName(config.getFunctionDetails())
+                + " -Dlog4j.configurationFile=java_instance_log4j2.xml"
+                + " -Djava.util.logging.manager=org.apache.logging.log4j.jul.LogManager"
+                + " -Dlog4j2.contextSelector=org.apache.logging.log4j.core.selector.BasicContextSelector"
+                + " -Dlog4j.shutdownHookEnabled=false "
+                + "-Dpulsar.function.log.dir=" + logDirectory + "/functions/"
+                + FunctionCommon.getFullyQualifiedName(config.getFunctionDetails())
                 + " -Dpulsar.function.log.file=" + config.getFunctionDetails().getName() + "-" + config.getInstanceId()
+                + " -Dio.netty.tryReflectionSetAccessible=true"
+                + " -Dorg.apache.pulsar.shade.io.netty.tryReflectionSetAccessible=true"
+                + " --add-opens java.base/java.nio=ALL-UNNAMED"
+                + " --add-opens java.base/jdk.internal.misc=ALL-UNNAMED"
+                + " --add-opens java.base/java.util.zip=ALL-UNNAMED"
                 + " org.apache.pulsar.functions.instance.JavaInstanceMain"
-                + " --jar " + userJarFile + " --instance_id "
-                + config.getInstanceId() + " --function_id " + config.getFunctionId()
+                + " --jar " + userJarFile
+                + " --transform_function_jar " + userJarFile
+                + " --transform_function_id " +  config.getTransformFunctionId()
+                + " --instance_id " + config.getInstanceId()
+                + " --function_id " + config.getFunctionId()
                 + " --function_version " + config.getFunctionVersion()
-                + " --function_details '" + JsonFormat.printer().omittingInsignificantWhitespace().print(config.getFunctionDetails())
+                + " --function_details '"
+                + config.getFunctionDetails().toJson()
                 + "' --pulsar_serviceurl " + pulsarServiceUrl
                 + pulsarAdminArg
-                + " --max_buffered_tuples 1024 --port " + args.get(portArg) + " --metrics_port " + args.get(metricsPortArg)
+                + " --max_buffered_tuples 1024 --port " + args.get(portArg) + " --metrics_port "
+                + args.get(metricsPortArg)
                 + " --pending_async_requests 200"
                 + " --state_storage_serviceurl " + stateStorageServiceUrl
                 + " --expected_healthcheck_interval 30"
@@ -366,7 +384,8 @@ public class ProcessRuntimeTest {
     }
 
     private void verifyPythonInstance(InstanceConfig config, String extraDepsDir) throws Exception {
-        ProcessRuntime container = factory.createContainer(config, userJarFile, null, 30l);
+        ProcessRuntime container = factory.createContainer(config, userJarFile, null, null,
+                null, 30L);
         List<String> args = container.getProcessArgs();
 
         int totalArgs = 36;
@@ -376,13 +395,14 @@ public class ProcessRuntimeTest {
         int configArg = 9;
 
         assertEquals(args.size(), totalArgs);
-        String expectedArgs = pythonPath + "python " + pythonInstanceFile
+        String expectedArgs = pythonPath + "python3 " + pythonInstanceFile
                 + " --py " + userJarFile + " --logging_directory "
                 + logDirectory + "/functions" + " --logging_file " + config.getFunctionDetails().getName()
                 + " --logging_config_file " + args.get(configArg) + " --instance_id "
                 + config.getInstanceId() + " --function_id " + config.getFunctionId()
                 + " --function_version " + config.getFunctionVersion()
-                + " --function_details '" + JsonFormat.printer().omittingInsignificantWhitespace().print(config.getFunctionDetails())
+                + " --function_details '"
+                + config.getFunctionDetails().toJson()
                 + "' --pulsar_serviceurl " + pulsarServiceUrl
                 + " --max_buffered_tuples 1024 --port " + args.get(portArg)
                 + " --metrics_port " + args.get(metricsPortArg)
@@ -395,10 +415,44 @@ public class ProcessRuntimeTest {
     }
 
     @Test
+    public void testGoConstructor() throws Exception {
+        InstanceConfig config = createJavaInstanceConfig(FunctionDetails.Runtime.GO);
+
+        factory = createProcessRuntimeFactory(null, null, false,
+                AuthenticationConfig.builder()
+                        .clientAuthenticationPlugin("com.MyAuth")
+                        .clientAuthenticationParameters("{\"authParam1\": \"authParamValue1\"}").build());
+
+        verifyGoInstance(config);
+    }
+
+    private void verifyGoInstance(InstanceConfig config) throws Exception {
+        String goExec = "/usr/bin/exec";
+        ProcessRuntime container = factory.createContainer(config, goExec, null, null, null, 30L);
+        List<String> args = container.getProcessArgs();
+
+        assertEquals(args.size(), 3);
+        assertEquals(args.get(0), goExec);
+        assertEquals(args.get(1), "-instance-conf");
+
+        HashMap<?, ?> goInstanceConfig = new ObjectMapper().readValue(args.get(2), HashMap.class);
+        assertEquals(goInstanceConfig.get("pulsarServiceURL"), pulsarServiceUrl);
+        assertEquals(goInstanceConfig.get("tenant"), TEST_TENANT);
+        assertEquals(goInstanceConfig.get("nameSpace"), TEST_NAMESPACE);
+        assertEquals(goInstanceConfig.get("name"), TEST_NAME);
+        assertEquals(goInstanceConfig.get("runtime"), 3);
+        assertEquals(goInstanceConfig.get("clientAuthenticationPlugin"), "com.MyAuth");
+        assertEquals(goInstanceConfig.get("clientAuthenticationParameters"), "{\"authParam1\": \"authParamValue1\"}");
+        assertEquals(goInstanceConfig.get("tlsTrustCertsFilePath"), "");
+        assertEquals(goInstanceConfig.get("tlsHostnameVerificationEnable"), false);
+        assertEquals(goInstanceConfig.get("tlsAllowInsecureConnection"), false);
+    }
+
+    @Test
     public void testJavaConstructorWithWebServiceUrlAndExposePulsarAdminClientEnabled() throws Exception {
         InstanceConfig config = createJavaInstanceConfig(FunctionDetails.Runtime.JAVA, true);
 
-        factory = createProcessRuntimeFactory(null, defaultWebServiceUrl, true);
+        factory = createProcessRuntimeFactory(null, defaultWebServiceUrl, true, null);
 
         verifyJavaInstance(config, null, defaultWebServiceUrl);
     }
@@ -407,7 +461,7 @@ public class ProcessRuntimeTest {
     public void testJavaConstructorWithWebServiceUrlAndExposePulsarAdminClientDisabled() throws Exception {
         InstanceConfig config = createJavaInstanceConfig(FunctionDetails.Runtime.JAVA, false);
 
-        factory = createProcessRuntimeFactory(null, defaultWebServiceUrl, false);
+        factory = createProcessRuntimeFactory(null, defaultWebServiceUrl, false, null);
 
         verifyJavaInstance(config, null, defaultWebServiceUrl);
     }
@@ -416,7 +470,7 @@ public class ProcessRuntimeTest {
     public void testJavaConstructorWithoutWebServiceUrlAndExposePulsarAdminClientEnabled() throws Exception {
         InstanceConfig config = createJavaInstanceConfig(FunctionDetails.Runtime.JAVA, true);
 
-        factory = createProcessRuntimeFactory(null, null, true);
+        factory = createProcessRuntimeFactory(null, null, true, null);
 
         verifyJavaInstance(config, null, null);
     }
@@ -425,7 +479,7 @@ public class ProcessRuntimeTest {
     public void testJavaConstructorWithoutWebServiceUrlAndExposePulsarAdminClientDisabled() throws Exception {
         InstanceConfig config = createJavaInstanceConfig(FunctionDetails.Runtime.JAVA, false);
 
-        factory = createProcessRuntimeFactory(null, null, false);
+        factory = createProcessRuntimeFactory(null, null, false, null);
 
         verifyJavaInstance(config, null, null);
     }

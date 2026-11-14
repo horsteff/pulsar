@@ -1,4 +1,4 @@
-/**
+/*
  * Licensed to the Apache Software Foundation (ASF) under one
  * or more contributor license agreements.  See the NOTICE file
  * distributed with this work for additional information
@@ -18,17 +18,44 @@
  */
 package org.apache.pulsar.broker.service;
 
+import static org.apache.pulsar.broker.loadbalance.extensions.channel.ServiceUnitStateTableViewImpl.TOPIC;
+import static org.testng.Assert.assertEquals;
 import static org.testng.Assert.assertFalse;
 import static org.testng.Assert.assertTrue;
 import static org.testng.Assert.fail;
-
+import java.util.List;
+import java.util.Map;
+import java.util.NoSuchElementException;
+import java.util.Set;
+import java.util.UUID;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.TimeUnit;
+import java.util.stream.Collectors;
+import lombok.Cleanup;
+import org.apache.pulsar.broker.BrokerTestUtil;
+import org.apache.pulsar.broker.ServiceConfiguration;
+import org.apache.pulsar.broker.loadbalance.extensions.ExtensibleLoadManagerImpl;
+import org.apache.pulsar.broker.service.persistent.PersistentTopic;
+import org.apache.pulsar.client.admin.ListNamespaceTopicsOptions;
 import org.apache.pulsar.client.admin.PulsarAdminException;
 import org.apache.pulsar.client.api.MessageId;
+import org.apache.pulsar.client.api.Producer;
+import org.apache.pulsar.client.api.PulsarClient;
 import org.apache.pulsar.client.api.PulsarClientException;
-import org.apache.pulsar.common.events.EventsTopicNames;
+import org.apache.pulsar.common.naming.NamespaceName;
+import org.apache.pulsar.common.naming.SystemTopicNames;
 import org.apache.pulsar.common.naming.TopicName;
+import org.apache.pulsar.common.partition.PartitionedTopicMetadata;
 import org.apache.pulsar.common.policies.data.AutoTopicCreationOverride;
+import org.apache.pulsar.common.policies.data.InactiveTopicDeleteMode;
+import org.apache.pulsar.common.policies.data.InactiveTopicPolicies;
+import org.apache.pulsar.common.policies.data.TenantInfoImpl;
 import org.apache.pulsar.common.policies.data.TopicType;
+import org.apache.pulsar.common.util.FutureUtil;
+import org.awaitility.Awaitility;
+import org.awaitility.core.ConditionTimeoutException;
+import org.testng.Assert;
+import org.testng.ITestResult;
 import org.testng.annotations.AfterClass;
 import org.testng.annotations.AfterMethod;
 import org.testng.annotations.BeforeClass;
@@ -37,7 +64,8 @@ import org.testng.annotations.Test;
 @Test(groups = "broker")
 public class BrokerServiceAutoTopicCreationTest extends BrokerTestBase{
 
-    @BeforeClass
+    // The test methods share the broker. After a failed method, the next one gets a new broker (TestRetrySupport).
+    @BeforeClass(alwaysRun = true)
     @Override
     protected void setup() throws Exception {
         super.baseSetup();
@@ -50,14 +78,56 @@ public class BrokerServiceAutoTopicCreationTest extends BrokerTestBase{
     }
 
     @AfterMethod(alwaysRun = true)
-    protected void cleanupTest() throws Exception {
-        pulsar.getAdminClient().namespaces().removeAutoTopicCreation("prop/ns-abc");
+    public void resetAutoTopicCreation(ITestResult result) throws Exception {
+        if (!result.isSuccess()) {
+            return;
+        }
+        // Undo the dynamic configuration the test stored. The broker restores a removed setting to its value at the
+        // start when it handles the change, after the removal returns, and it handles the changes in order: once it
+        // handled one more, it restored them all.
+        Set<String> dynamicConfigurationNames = admin.brokers().getAllDynamicConfigurations().keySet();
+        if (!dynamicConfigurationNames.isEmpty()) {
+            for (String name : dynamicConfigurationNames) {
+                admin.brokers().deleteDynamicConfiguration(name);
+            }
+            int minReadBatchSize = pulsar.getConfiguration().getDispatcherMinReadBatchSize();
+            try {
+                admin.brokers().updateDynamicConfiguration("dispatcherMinReadBatchSize",
+                        Integer.toString(minReadBatchSize + 1));
+                Awaitility.await().pollInterval(10, TimeUnit.MILLISECONDS).until(
+                        () -> pulsar.getConfiguration().getDispatcherMinReadBatchSize() == minReadBatchSize + 1);
+                admin.brokers().deleteDynamicConfiguration("dispatcherMinReadBatchSize");
+                Awaitility.await().pollInterval(10, TimeUnit.MILLISECONDS).until(
+                        () -> pulsar.getConfiguration().getDispatcherMinReadBatchSize() == minReadBatchSize);
+            } catch (ConditionTimeoutException e) {
+                // the broker didn't apply the changes, which the dynamic configuration tests report: the next
+                // method gets a new broker
+                cleanup();
+                setup();
+                return;
+            }
+        }
+        // and what the test set on the namespace and on the broker's configuration
+        admin.namespaces().removeAutoTopicCreation("prop/ns-abc");
+        ServiceConfiguration defaultConf = getDefaultConf();
+        ServiceConfiguration config = pulsar.getConfiguration();
+        config.setAllowAutoTopicCreation(defaultConf.isAllowAutoTopicCreation());
+        config.setAllowAutoTopicCreationType(defaultConf.getAllowAutoTopicCreationType());
+        config.setDefaultNumPartitions(defaultConf.getDefaultNumPartitions());
+        config.setMaxNumPartitionsPerPartitionedTopic(defaultConf.getMaxNumPartitionsPerPartitionedTopic());
+    }
+
+    // a namespace without the topics that the earlier test methods left in prop/ns-abc
+    private String newNamespace() throws PulsarAdminException {
+        String namespace = BrokerTestUtil.newUniqueName("prop/ns");
+        admin.namespaces().createNamespace(namespace);
+        return namespace;
     }
 
     @Test
     public void testAutoNonPartitionedTopicCreation() throws Exception{
         pulsar.getConfiguration().setAllowAutoTopicCreation(true);
-        pulsar.getConfiguration().setAllowAutoTopicCreationType("non-partitioned");
+        pulsar.getConfiguration().setAllowAutoTopicCreationType(TopicType.NON_PARTITIONED);
 
         final String topicString = "persistent://prop/ns-abc/non-partitioned-topic";
         final String subscriptionName = "non-partitioned-topic-sub";
@@ -68,9 +138,31 @@ public class BrokerServiceAutoTopicCreationTest extends BrokerTestBase{
     }
 
     @Test
+    public void testAutoTopicCreationRejectsSurroundingWhitespace() throws Exception {
+        pulsar.getConfiguration().setAllowAutoTopicCreation(true);
+        pulsar.getConfiguration().setAllowAutoTopicCreationType(TopicType.NON_PARTITIONED);
+
+        // Go straight to the broker service: the Java client trims topic names, so it could never send this name.
+        final String topicString = "persistent://prop/ns-abc/auto-created-with-whitespace ";
+        assertFalse(pulsar.getBrokerService().isAllowAutoTopicCreationAsync(topicString).get());
+
+        try {
+            pulsar.getBrokerService().getOrCreateTopic(topicString).get();
+            fail("Should not have auto-created a topic whose name has surrounding whitespace");
+        } catch (ExecutionException e) {
+            // Auto-creation is denied, so getTopic returns Optional.empty() and getOrCreateTopic's
+            // thenApply(Optional::get) throws NoSuchElementException for that empty optional.
+            Throwable root = FutureUtil.unwrapCompletionException(e);
+            assertTrue(root instanceof NoSuchElementException,
+                    "expected NoSuchElementException because the topic was not auto-created, got: " + root);
+        }
+        assertFalse(admin.namespaces().getTopics("prop/ns-abc").contains(topicString));
+    }
+
+    @Test
     public void testAutoNonPartitionedTopicCreationOnProduce() throws Exception{
         pulsar.getConfiguration().setAllowAutoTopicCreation(true);
-        pulsar.getConfiguration().setAllowAutoTopicCreationType("non-partitioned");
+        pulsar.getConfiguration().setAllowAutoTopicCreationType(TopicType.NON_PARTITIONED);
 
         final String topicString = "persistent://prop/ns-abc/non-partitioned-topic-2";
         pulsarClient.newProducer().topic(topicString).create();
@@ -82,7 +174,7 @@ public class BrokerServiceAutoTopicCreationTest extends BrokerTestBase{
     @Test
     public void testAutoPartitionedTopicCreation() throws Exception{
         pulsar.getConfiguration().setAllowAutoTopicCreation(true);
-        pulsar.getConfiguration().setAllowAutoTopicCreationType("partitioned");
+        pulsar.getConfiguration().setAllowAutoTopicCreationType(TopicType.PARTITIONED);
         pulsar.getConfiguration().setDefaultNumPartitions(3);
 
         final String topicString = "persistent://prop/ns-abc/partitioned-topic";
@@ -98,7 +190,7 @@ public class BrokerServiceAutoTopicCreationTest extends BrokerTestBase{
     @Test
     public void testAutoPartitionedTopicCreationOnProduce() throws Exception{
         pulsar.getConfiguration().setAllowAutoTopicCreation(true);
-        pulsar.getConfiguration().setAllowAutoTopicCreationType("partitioned");
+        pulsar.getConfiguration().setAllowAutoTopicCreationType(TopicType.PARTITIONED);
         pulsar.getConfiguration().setDefaultNumPartitions(3);
 
         final String topicString = "persistent://prop/ns-abc/partitioned-topic-1";
@@ -128,7 +220,7 @@ public class BrokerServiceAutoTopicCreationTest extends BrokerTestBase{
     @Test
     public void testAutoTopicCreationDisableIfNonPartitionedTopicAlreadyExist() throws Exception {
         pulsar.getConfiguration().setAllowAutoTopicCreation(true);
-        pulsar.getConfiguration().setAllowAutoTopicCreationType("partitioned");
+        pulsar.getConfiguration().setAllowAutoTopicCreationType(TopicType.PARTITIONED);
         pulsar.getConfiguration().setDefaultNumPartitions(3);
 
         final String topicString = "persistent://prop/ns-abc/test-topic-2";
@@ -141,6 +233,7 @@ public class BrokerServiceAutoTopicCreationTest extends BrokerTestBase{
             assertFalse(admin.namespaces().getTopics("prop/ns-abc").contains(topicString + "-partition-" + i));
         }
         assertTrue(admin.namespaces().getTopics("prop/ns-abc").contains(topicString));
+        admin.topics().delete(topicString, true);
     }
 
     /**
@@ -151,7 +244,7 @@ public class BrokerServiceAutoTopicCreationTest extends BrokerTestBase{
     @Test
     public void testGetPartitionedMetadataWithoutCheckAllowAutoCreation() throws Exception{
         pulsar.getConfiguration().setAllowAutoTopicCreation(true);
-        pulsar.getConfiguration().setAllowAutoTopicCreationType("partitioned");
+        pulsar.getConfiguration().setAllowAutoTopicCreationType(TopicType.PARTITIONED);
         pulsar.getConfiguration().setDefaultNumPartitions(3);
 
         final String topicString = "persistent://prop/ns-abc/test-topic-3";
@@ -168,11 +261,13 @@ public class BrokerServiceAutoTopicCreationTest extends BrokerTestBase{
         final String subscriptionName = "test-topic-sub-4";
         final TopicName topicName = TopicName.get(topicString);
         pulsar.getConfiguration().setAllowAutoTopicCreation(false);
-        pulsar.getAdminClient().namespaces().setAutoTopicCreation(topicName.getNamespace(),
-                AutoTopicCreationOverride.builder()
-                        .allowAutoTopicCreation(true)
-                        .topicType(TopicType.NON_PARTITIONED.toString())
-                        .build());
+        AutoTopicCreationOverride autoTopicCreationOverride = AutoTopicCreationOverride.builder()
+                .allowAutoTopicCreation(true)
+                .topicType(TopicType.NON_PARTITIONED.toString())
+                .build();
+        pulsar.getAdminClient().namespaces().setAutoTopicCreation(topicName.getNamespace(), autoTopicCreationOverride);
+        Assert.assertEquals(pulsar.getAdminClient().namespaces().getAutoTopicCreation(topicName.getNamespace()),
+                autoTopicCreationOverride);
 
         pulsarClient.newConsumer().topic(topicString).subscriptionName(subscriptionName).subscribe();
         assertTrue(admin.namespaces().getTopics("prop/ns-abc").contains(topicString));
@@ -185,10 +280,12 @@ public class BrokerServiceAutoTopicCreationTest extends BrokerTestBase{
         final String subscriptionName = "test-topic-sub-5";
         final TopicName topicName = TopicName.get(topicString);
         pulsar.getConfiguration().setAllowAutoTopicCreation(true);
-        pulsar.getAdminClient().namespaces().setAutoTopicCreation(topicName.getNamespace(),
-                AutoTopicCreationOverride.builder()
-                        .allowAutoTopicCreation(false)
-                        .build());
+        AutoTopicCreationOverride autoTopicCreationOverride = AutoTopicCreationOverride.builder()
+                .allowAutoTopicCreation(false)
+                .build();
+        pulsar.getAdminClient().namespaces().setAutoTopicCreation(topicName.getNamespace(), autoTopicCreationOverride);
+        Assert.assertEquals(pulsar.getAdminClient().namespaces().getAutoTopicCreation(topicName.getNamespace()),
+                autoTopicCreationOverride);
 
         try {
             pulsarClient.newConsumer().topic(topicString).subscriptionName(subscriptionName).subscribe();
@@ -205,12 +302,14 @@ public class BrokerServiceAutoTopicCreationTest extends BrokerTestBase{
         final TopicName topicName = TopicName.get(topicString);
 
         pulsar.getConfiguration().setAllowAutoTopicCreation(false);
-        pulsar.getAdminClient().namespaces().setAutoTopicCreation(topicName.getNamespace(),
-                AutoTopicCreationOverride.builder()
-                        .allowAutoTopicCreation(true)
-                        .topicType(TopicType.PARTITIONED.toString())
-                        .defaultNumPartitions(4)
-                        .build());
+        AutoTopicCreationOverride autoTopicCreationOverride = AutoTopicCreationOverride.builder()
+                .allowAutoTopicCreation(true)
+                .topicType(TopicType.PARTITIONED.toString())
+                .defaultNumPartitions(4)
+                .build();
+        pulsar.getAdminClient().namespaces().setAutoTopicCreation(topicName.getNamespace(), autoTopicCreationOverride);
+        Assert.assertEquals(pulsar.getAdminClient().namespaces().getAutoTopicCreation(topicName.getNamespace()),
+                autoTopicCreationOverride);
 
         final String subscriptionName = "test-topic-sub-6";
         pulsarClient.newConsumer().topic(topicString).subscriptionName(subscriptionName).subscribe();
@@ -227,7 +326,7 @@ public class BrokerServiceAutoTopicCreationTest extends BrokerTestBase{
         final TopicName topicName = TopicName.get(topicString);
 
         pulsar.getConfiguration().setAllowAutoTopicCreation(true);
-        pulsar.getConfiguration().setAllowAutoTopicCreationType("non-partitioned");
+        pulsar.getConfiguration().setAllowAutoTopicCreationType(TopicType.NON_PARTITIONED);
         pulsar.getAdminClient().namespaces().setAutoTopicCreation(topicName.getNamespace(),
                 AutoTopicCreationOverride.builder()
                         .allowAutoTopicCreation(true)
@@ -250,7 +349,7 @@ public class BrokerServiceAutoTopicCreationTest extends BrokerTestBase{
         final TopicName topicName = TopicName.get(topicString);
 
         pulsar.getConfiguration().setAllowAutoTopicCreation(true);
-        pulsar.getConfiguration().setAllowAutoTopicCreationType("partitioned");
+        pulsar.getConfiguration().setAllowAutoTopicCreationType(TopicType.PARTITIONED);
         pulsar.getConfiguration().setDefaultNumPartitions(2);
         pulsar.getAdminClient().namespaces().setAutoTopicCreation(topicName.getNamespace(),
                 AutoTopicCreationOverride.builder()
@@ -271,7 +370,7 @@ public class BrokerServiceAutoTopicCreationTest extends BrokerTestBase{
         final TopicName topicName = TopicName.get(topicString);
 
         pulsar.getConfiguration().setAllowAutoTopicCreation(true);
-        pulsar.getConfiguration().setAllowAutoTopicCreationType("partitioned");
+        pulsar.getConfiguration().setAllowAutoTopicCreationType(TopicType.PARTITIONED);
         pulsar.getConfiguration().setDefaultNumPartitions(2);
         pulsar.getAdminClient().namespaces().setAutoTopicCreation(topicName.getNamespace(),
                 AutoTopicCreationOverride.builder()
@@ -351,46 +450,299 @@ public class BrokerServiceAutoTopicCreationTest extends BrokerTestBase{
     }
 
     @Test
-    public void testMaxNumPartitionsPerPartitionedTopicTopicCreation() {
+    public void testAutoCreationNamespaceOverridesSubscriptionTopicCreation() throws Exception {
+        pulsar.getConfiguration().setAllowAutoTopicCreation(false);
+        String topicString = "persistent://prop/ns-abc/non-partitioned-topic" + System.currentTimeMillis();
+        String subscriptionName = "non-partitioned-topic-sub";
+        final TopicName topicName = TopicName.get(topicString);
+        pulsar.getAdminClient().namespaces().setAutoTopicCreation(topicName.getNamespace(),
+                AutoTopicCreationOverride.builder()
+                        .allowAutoTopicCreation(true)
+                        .topicType(TopicType.NON_PARTITIONED.toString())
+                        .build());
+
+        admin.topics().createSubscription(topicString, subscriptionName, MessageId.earliest);
+    }
+
+    @Test
+    public void testMaxNumPartitionsPerPartitionedTopicTopicCreation() throws Exception {
         pulsar.getConfiguration().setAllowAutoTopicCreation(true);
-        pulsar.getConfiguration().setAllowAutoTopicCreationType("partitioned");
+        pulsar.getConfiguration().setAllowAutoTopicCreationType(TopicType.PARTITIONED);
         pulsar.getConfiguration().setDefaultNumPartitions(3);
         pulsar.getConfiguration().setMaxNumPartitionsPerPartitionedTopic(2);
 
         final String topicString = "persistent://prop/ns-abc/partitioned-test-topic-11";
         final String subscriptionName = "test-topic-sub-11";
 
+        // A binary lookup: the broker refuses at once, not with an error that the client retries until its
+        // operation timeout
+        @Cleanup
+        PulsarClient client = PulsarClient.builder().serviceUrl(pulsar.getBrokerServiceUrl()).build();
         try {
-            pulsarClient.newConsumer().topic(topicString).subscriptionName(subscriptionName).subscribe();
+            client.newConsumer().topic(topicString).subscriptionName(subscriptionName).subscribe();
             fail("should throw exception when number of partitions exceed than max partitions");
         } catch (Exception e) {
-            assertTrue(e instanceof PulsarClientException);
+            assertTrue(e instanceof PulsarClientException.NotAllowedException, e.toString());
+        }
+
+        // An HTTP lookup: the client retries the broker's error until its lookup timeout
+        @Cleanup
+        PulsarClient httpClient = PulsarClient.builder().serviceUrl(pulsar.getWebServiceAddress())
+                .lookupTimeout(1, TimeUnit.SECONDS).build();
+        try {
+            httpClient.newConsumer().topic(topicString).subscriptionName(subscriptionName).subscribe();
+            fail("should throw exception when number of partitions exceed than max partitions");
+        } catch (Exception e) {
+            assertTrue(e instanceof PulsarClientException, e.toString());
         }
     }
 
     @Test
     public void testAutoCreationOfSystemTopicTransactionBufferSnapshot() throws Exception {
         pulsar.getConfiguration().setAllowAutoTopicCreation(false);
-        pulsar.getConfiguration().setSystemTopicEnabled(true);
 
-        final String topicString = "persistent://prop/ns-abc/" + EventsTopicNames.TRANSACTION_BUFFER_SNAPSHOT;
+        // a namespace that no earlier test method loaded, so the system topic doesn't exist yet
+        final String namespace = newNamespace();
+        final String topicString = "persistent://" + namespace + "/" + SystemTopicNames.TRANSACTION_BUFFER_SNAPSHOT;
+        assertFalse(pulsar.getPulsarResources().getTopicResources()
+                .persistentTopicExists(TopicName.get(topicString)).get());
 
         pulsarClient.newProducer().topic(topicString).create();
 
-        assertTrue(admin.namespaces().getTopics("prop/ns-abc").contains(topicString));
-        assertFalse(admin.topics().getPartitionedTopicList("prop/ns-abc").contains(topicString));
+        assertTrue(admin.namespaces().getTopics(namespace,
+                ListNamespaceTopicsOptions.builder().includeSystemTopic(true).build()).contains(topicString));
+        assertFalse(admin.topics().getPartitionedTopicList(namespace).contains(topicString));
     }
 
     @Test
     public void testAutoCreationOfSystemTopicNamespaceEvents() throws Exception {
         pulsar.getConfiguration().setAllowAutoTopicCreation(false);
-        pulsar.getConfiguration().setSystemTopicEnabled(true);
 
-        final String topicString = "persistent://prop/ns-abc/" + EventsTopicNames.NAMESPACE_EVENTS_LOCAL_NAME;
+        // a namespace that no earlier test method loaded: loading one creates its __change_events topic (the topic
+        // policies reader), which would leave nothing for this test to create
+        final String namespace = newNamespace();
+        final String topicString = "persistent://" + namespace + "/" + SystemTopicNames.NAMESPACE_EVENTS_LOCAL_NAME;
+        assertFalse(pulsar.getPulsarResources().getTopicResources()
+                .persistentTopicExists(TopicName.get(topicString)).get());
 
-        pulsarClient.newProducer().topic(topicString).create();
+        @Cleanup
+        Producer<byte[]> producer = pulsarClient.newProducer().topic(topicString).create();
 
-        assertTrue(admin.namespaces().getTopics("prop/ns-abc").contains(topicString));
-        assertFalse(admin.topics().getPartitionedTopicList("prop/ns-abc").contains(topicString));
+        assertTrue(admin.namespaces().getTopics(namespace,
+                ListNamespaceTopicsOptions.builder().includeSystemTopic(true).build()).contains(topicString));
+        assertFalse(admin.topics().getPartitionedTopicList(namespace).contains(topicString));
     }
+
+    @Test
+    public void testDynamicConfigurationTopicAutoCreationDisable() throws PulsarAdminException {
+        // test disable AllowAutoTopicCreation
+        pulsar.getConfiguration().setAllowAutoTopicCreation(true);
+        admin.brokers().updateDynamicConfiguration("allowAutoTopicCreation", "false");
+        final String namespaceName = "prop/ns-abc";
+        final String topic = "persistent://" + namespaceName + "/test-dynamicConfiguration-topic-auto-creation-"
+                + UUID.randomUUID();
+        Assert.assertThrows(PulsarClientException.NotFoundException.class,
+                ()-> pulsarClient.newProducer().topic(topic).create());
+    }
+
+    @Test
+    public void testDynamicConfigurationTopicAutoCreationNonPartitioned()
+            throws PulsarAdminException, PulsarClientException {
+        pulsar.getConfiguration().setAllowAutoTopicCreation(false);
+        pulsar.getConfiguration().setAllowAutoTopicCreationType(TopicType.PARTITIONED);
+        final String namespaceName = newNamespace();
+        final String topic = "persistent://" + namespaceName + "/test-dynamicConfiguration-topic-auto-creation-"
+                + UUID.randomUUID();
+        // test enable AllowAutoTopicCreation, non-partitioned
+        admin.brokers().updateDynamicConfiguration("allowAutoTopicCreation", "true");
+        admin.brokers().updateDynamicConfiguration("allowAutoTopicCreationType", "non-partitioned");
+        Producer<byte[]> producer = pulsarClient.newProducer()
+                .topic(topic)
+                .create();
+        List<String> topics = admin.topics().getList(namespaceName);
+        List<String> partitionedTopicList = admin.topics().getPartitionedTopicList(namespaceName);
+        assertEquals(topics.size(), 1);
+        assertEquals(partitionedTopicList.size(), 0);
+        producer.close();
+        admin.topics().delete(topic);
+    }
+
+    @Test
+    public void testDynamicConfigurationTopicAutoCreationPartitioned()
+            throws PulsarAdminException, PulsarClientException {
+        pulsar.getConfiguration().setAllowAutoTopicCreation(false);
+        pulsar.getConfiguration().setAllowAutoTopicCreationType(TopicType.NON_PARTITIONED);
+        pulsar.getConfiguration().setMaxNumPartitionsPerPartitionedTopic(0);
+        final String namespaceName = newNamespace();
+        final String topic = "persistent://" + namespaceName + "/test-dynamicConfiguration-topic-auto-creation-"
+                + UUID.randomUUID();
+        // test enable AllowAutoTopicCreation, partitioned
+        admin.brokers().updateDynamicConfigurationAsync("allowAutoTopicCreation", "true");
+        admin.brokers().updateDynamicConfiguration("maxNumPartitionsPerPartitionedTopic", "6");
+        admin.brokers().updateDynamicConfiguration("allowAutoTopicCreationType", "partitioned");
+        admin.brokers().updateDynamicConfiguration("defaultNumPartitions", "4");
+        Awaitility.await().atMost(5, TimeUnit.SECONDS).untilAsserted(() -> {
+            assertTrue(pulsar.getConfiguration().isAllowAutoTopicCreation());
+            assertEquals(pulsar.getConfiguration().getMaxNumPartitionsPerPartitionedTopic(), 6);
+            assertEquals(pulsar.getConfiguration().getAllowAutoTopicCreationType(), TopicType.PARTITIONED);
+            assertEquals(pulsar.getConfiguration().getDefaultNumPartitions(), 4);
+
+        });
+        Producer<byte[]> producer  = pulsarClient.newProducer().topic(topic).create();
+        List<String> topics = admin.topics().getList(namespaceName);
+        List<String> partitionedTopicList = admin.topics().getPartitionedTopicList(namespaceName);
+        PartitionedTopicMetadata partitionedTopicMetadata = admin.topics().getPartitionedTopicMetadata(topic);
+        assertEquals(topics.size(), 4);
+        assertEquals(partitionedTopicList.size(), 1);
+        assertEquals(partitionedTopicMetadata.partitions, 4);
+        producer.close();
+        for (String t : topics) {
+            admin.topics().delete(t);
+        }
+    }
+
+    @Test
+    public void testDynamicConfigurationTopicAutoCreationPartitionedWhenDefaultMoreThanMax()
+            throws PulsarAdminException, PulsarClientException {
+        pulsar.getConfiguration().setAllowAutoTopicCreation(true);
+        pulsar.getConfiguration().setAllowAutoTopicCreationType(TopicType.PARTITIONED);
+        pulsar.getConfiguration().setMaxNumPartitionsPerPartitionedTopic(0);
+        final String namespaceName = newNamespace();
+        String topic = "persistent://" + namespaceName + "/test-dynamicConfiguration-topic-auto-creation-"
+                + UUID.randomUUID();
+        // test enable AllowAutoTopicCreation,
+        // partitioned when maxNumPartitionsPerPartitionedTopic < defaultNumPartitions
+        admin.brokers().updateDynamicConfiguration("maxNumPartitionsPerPartitionedTopic", "2");
+        admin.brokers().updateDynamicConfiguration("defaultNumPartitions", "6");
+        Producer<byte[]> producer = pulsarClient.newProducer().topic(topic).create();
+        List<String> topics = admin.topics().getList(namespaceName);
+        List<String> partitionedTopicList = admin.topics().getPartitionedTopicList(namespaceName);
+        PartitionedTopicMetadata partitionedTopicMetadata = admin.topics().getPartitionedTopicMetadata(topic);
+        assertEquals(topics.size(), 2);
+        assertEquals(partitionedTopicList.size(), 1);
+        assertEquals(partitionedTopicMetadata.partitions, 2);
+        producer.close();
+        for (String t : topics) {
+            admin.topics().delete(t);
+        }
+
+        // set maxNumPartitionsPerPartitionedTopic, make maxNumPartitionsPerPartitionedTopic < defaultNumPartitions
+        admin.brokers().updateDynamicConfiguration("maxNumPartitionsPerPartitionedTopic", "1");
+        // Make sure the dynamic cache is updated to prevent the flaky test.
+        Awaitility.await().untilAsserted(() ->
+                assertEquals(admin.brokers().getAllDynamicConfigurations()
+                        .get("maxNumPartitionsPerPartitionedTopic"), "1"));
+        topic = "persistent://" + namespaceName + "/test-dynamicConfiguration-topic-auto-creation-"
+                + UUID.randomUUID();
+        producer = pulsarClient.newProducer().topic(topic).create();
+        topics = admin.topics().getList(namespaceName);
+        assertEquals(topics.size(), 1);
+        producer.close();
+        for (String t : topics) {
+            admin.topics().delete(t);
+        }
+    }
+
+    @Test
+    public void testExtensibleLoadManagerImplInternalTopicAutoCreations()
+            throws PulsarAdminException, PulsarClientException {
+        pulsar.getConfiguration().setAllowAutoTopicCreation(true);
+        pulsar.getConfiguration().setAllowAutoTopicCreationType(TopicType.PARTITIONED);
+        pulsar.getConfiguration().setDefaultNumPartitions(3);
+        pulsar.getConfiguration().setMaxNumPartitionsPerPartitionedTopic(5);
+        final String namespaceName = NamespaceName.SYSTEM_NAMESPACE.toString();
+        TenantInfoImpl tenantInfo = new TenantInfoImpl();
+        tenantInfo.setAllowedClusters(Set.of(configClusterName));
+        admin.tenants().createTenant("pulsar", tenantInfo);
+        admin.namespaces().createNamespace(namespaceName);
+        admin.topics().createNonPartitionedTopic(TOPIC);
+        admin.topics().createNonPartitionedTopic(ExtensibleLoadManagerImpl.BROKER_LOAD_DATA_STORE_TOPIC);
+        admin.topics().createNonPartitionedTopic(ExtensibleLoadManagerImpl.TOP_BUNDLES_LOAD_DATA_STORE_TOPIC);
+
+        // clear the topics to test the auto creation of non-persistent topics.
+        final var topics = pulsar.getBrokerService().getTopics();
+        final var oldTopics = topics.entrySet().stream().collect(Collectors.toMap(Map.Entry::getKey,
+                Map.Entry::getValue));
+        topics.clear();
+
+        // The created persistent topic correctly can be found by
+        // pulsar.getPulsarResources().getTopicResources().persistentTopicExists(topic);
+        Producer producer = pulsarClient.newProducer().topic(TOPIC).create();
+
+        // The created non-persistent topics cannot be found, as we did topics.clear()
+        try {
+            pulsarClient.newProducer().topic(ExtensibleLoadManagerImpl.BROKER_LOAD_DATA_STORE_TOPIC).create();
+            Assert.fail("Create should have failed.");
+        } catch (PulsarClientException.TopicDoesNotExistException | PulsarClientException.NotFoundException e) {
+            // expected
+        }
+        try {
+            pulsarClient.newProducer().topic(ExtensibleLoadManagerImpl.TOP_BUNDLES_LOAD_DATA_STORE_TOPIC).create();
+            Assert.fail("Create should have failed.");
+        } catch (PulsarClientException.TopicDoesNotExistException | PulsarClientException.NotFoundException e) {
+            // expected
+        }
+
+        oldTopics.forEach((key, val) -> topics.put(key, val));
+
+        Awaitility.await().atMost(5, TimeUnit.SECONDS).untilAsserted(() -> {
+            List<String> partitionedTopicList = admin.topics().getPartitionedTopicList(namespaceName);
+            assertEquals(partitionedTopicList.size(), 0);
+        });
+
+        producer.close();
+        admin.namespaces().deleteNamespace(namespaceName);
+        admin.tenants().deleteTenant("pulsar");
+
+    }
+
+    @Test
+    public void testCreateTopicAfterGC() throws Exception {
+        final String topic = BrokerTestUtil.newUniqueName("persistent://prop/ns-abc/tp");
+        final String topicP0 = TopicName.get(topic).getPartition(0).toString();
+        // Disable topic auto-creation.
+        boolean originalAllowAutoTopicCreation = pulsar.getConfiguration().isAllowAutoTopicCreation();
+        boolean originalDeleteInactiveTopics =
+                pulsar.getConfiguration().isBrokerDeleteInactiveTopicsEnabled();
+        boolean originalDeleteInactivePartitionedTopicMetadataE =
+                pulsar.getConfiguration().isBrokerDeleteInactivePartitionedTopicMetadataEnabled();
+        pulsar.getConfiguration().setAllowAutoTopicCreation(false);
+        pulsar.getConfiguration().setBrokerDeleteInactiveTopicsEnabled(true);
+        pulsar.getConfiguration().setBrokerDeleteInactivePartitionedTopicMetadataEnabled(false);
+        // Create partitioned topic.
+        Assert.assertThrows(PulsarClientException.NotFoundException.class,
+                () -> pulsarClient.newProducer().topic(topic).create());
+        admin.topics().createPartitionedTopic(topic, 1);
+        PersistentTopic persistentTopic =
+                (PersistentTopic) pulsar.getBrokerService().getTopic(topicP0, false).join().get();
+        // Enable topic GC.
+        InactiveTopicPolicies inactiveTopicPolicies =
+                new InactiveTopicPolicies(InactiveTopicDeleteMode.delete_when_no_subscriptions, 1, true);
+        admin.topicPolicies().setInactiveTopicPolicies(topic, inactiveTopicPolicies);
+        Awaitility.await().atMost(5, TimeUnit.SECONDS).untilAsserted(() -> {
+            assertEquals(persistentTopic.topicPolicies.getInactiveTopicPolicies().getTopicValue()
+                    .getInactiveTopicDeleteMode(), InactiveTopicDeleteMode.delete_when_no_subscriptions);
+            assertEquals(persistentTopic.topicPolicies.getInactiveTopicPolicies().getTopicValue()
+                    .getMaxInactiveDurationSeconds(), 1);
+            assertTrue(persistentTopic.topicPolicies.getInactiveTopicPolicies().getTopicValue()
+                    .isDeleteWhileInactive());
+        });
+        // Trigger topic GC.
+        Awaitility.await().atMost(5, TimeUnit.SECONDS).untilAsserted(() -> {
+            persistentTopic.checkGC();
+            assertFalse(pulsar.getPulsarResources().getTopicResources()
+                    .persistentTopicExists(TopicName.get(topicP0)).get());
+        });
+
+        // Verify: the missed partition can be loaded up since the partitioned topic metadata exists.
+        pulsarClient.newProducer().topic(topic).create().close();
+
+        // cleanup.
+        admin.topics().deletePartitionedTopic(topic);
+        pulsar.getConfiguration().setAllowAutoTopicCreation(originalAllowAutoTopicCreation);
+        pulsar.getConfiguration().setBrokerDeleteInactiveTopicsEnabled(originalDeleteInactiveTopics);
+        pulsar.getConfiguration().setBrokerDeleteInactivePartitionedTopicMetadataEnabled(
+                originalDeleteInactivePartitionedTopicMetadataE);
+    }
+
 }

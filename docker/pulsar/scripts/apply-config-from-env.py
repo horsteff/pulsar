@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 #
 # Licensed to the Apache Software Foundation (ASF) under one
 # or more contributor license agreements.  See the NOTICE file
@@ -25,17 +25,34 @@
 ## ./apply-config-from-env file.conf
 ##
 
-import os, sys
+import os, re, sys, argparse
 
-if len(sys.argv) < 2:
-    print('Usage: %s' % (sys.argv[0]))
+parser = argparse.ArgumentParser(description='Pulsar configuration file customizer based on environment variables')
+parser.add_argument('--prefix', default='PULSAR_PREFIX_', help='Prefix for environment variables, default is PULSAR_PREFIX_')
+parser.add_argument('conf_files', nargs='*', help='Configuration files')
+args = parser.parse_args()
+if not args.conf_files:
+    parser.print_help()
     sys.exit(1)
 
-# Always apply env config to env scripts as well
-conf_files = sys.argv[1:]
+env_prefix = args.prefix
+conf_files = args.conf_files
 
-PF_ENV_PREFIX = 'PULSAR_PREFIX_'
 PF_ENV_DEBUG = (os.environ.get('PF_ENV_DEBUG','0') == '1')
+
+# Keys whose value may hold a secret (passwords, tokens, keys, credentials, authentication / TLS factory
+# parameters or basic authentication password hashes) and must not be displayed in logs. Case-insensitive
+# substring match, which also covers prefixed pass-through keys such as brokerClient_authParams. Keep in sync
+# with PulsarConfigurationLoader.SENSITIVE_KEY_PATTERN.
+SENSITIVE_KEY_PATTERN = re.compile(
+    'password|passwd|secret|token|credential|accesskey|privatekey|authparam|authenticationparam|factoryconfig'
+    '|basicauth',
+    re.IGNORECASE)
+
+def sanitize_display_value(k, v):
+    if v and SENSITIVE_KEY_PATTERN.search(k):
+        return "********"
+    return v
 
 for conf_filename in conf_files:
     lines = []  # List of config file lines
@@ -47,7 +64,6 @@ for conf_filename in conf_files:
         line = line.strip()
         if not line:
             continue
-
         try:
             k,v = line.split('=', 1)
             if k.startswith('#'):
@@ -61,33 +77,26 @@ for conf_filename in conf_files:
     for k in sorted(os.environ.keys()):
         v = os.environ[k].strip()
 
-        # Hide the value in logs if is password.
-        if "password" in k:
-            displayValue = "********"
-        else:
-            displayValue = v
-
-        if k.startswith(PF_ENV_PREFIX):
-            k = k[len(PF_ENV_PREFIX):]
         if k in keys:
+            displayValue = sanitize_display_value(k, v)
             print('[%s] Applying config %s = %s' % (conf_filename, k, displayValue))
             idx = keys[k]
             lines[idx] = '%s=%s\n' % (k, v)
 
+    # Ensure we have a new-line at the end of the file, to avoid issue
+    # when appending more lines to the config
+    lines.append('\n')
 
     # Add new keys from Env
     for k in sorted(os.environ.keys()):
-        v = os.environ[k]
-        if not k.startswith(PF_ENV_PREFIX):
+        if not k.startswith(env_prefix):
             continue
 
-        # Hide the value in logs if is password.
-        if "password" in k:
-            displayValue = "********"
-        else:
-            displayValue = v
+        v = os.environ[k].strip()
+        k = k[len(env_prefix):]
 
-        k = k[len(PF_ENV_PREFIX):]
+        displayValue = sanitize_display_value(k, v)
+
         if k not in keys:
             print('[%s] Adding config %s = %s' % (conf_filename, k, displayValue))
             lines.append('%s=%s\n' % (k, v))
@@ -95,10 +104,8 @@ for conf_filename in conf_files:
             print('[%s] Updating config %s = %s' % (conf_filename, k, displayValue))
             lines[keys[k]] = '%s=%s\n' % (k, v)
 
-
     # Store back the updated config in the same file
     f = open(conf_filename, 'w')
     for line in lines:
         f.write(line)
     f.close()
-

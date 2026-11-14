@@ -1,4 +1,4 @@
-/**
+/*
  * Licensed to the Apache Software Foundation (ASF) under one
  * or more contributor license agreements.  See the NOTICE file
  * distributed with this work for additional information
@@ -18,11 +18,9 @@
  */
 package org.apache.pulsar.common.policies.data;
 
-import com.fasterxml.jackson.core.JsonProcessingException;
+import java.util.Collections;
 import org.testng.Assert;
 import org.testng.annotations.Test;
-
-import java.util.Collections;
 
 public class EnsemblePlacementPolicyConfigTest {
 
@@ -33,7 +31,7 @@ public class EnsemblePlacementPolicyConfigTest {
         throws EnsemblePlacementPolicyConfig.ParseEnsemblePlacementPolicyConfigException {
 
         EnsemblePlacementPolicyConfig originalConfig =
-            new EnsemblePlacementPolicyConfig(MockedEnsemblePlacementPolicy.class, Collections.EMPTY_MAP);
+            new EnsemblePlacementPolicyConfig(MockedEnsemblePlacementPolicy.class, Collections.emptyMap());
         byte[] encodedConfig = originalConfig.encode();
 
         EnsemblePlacementPolicyConfig decodedConfig =

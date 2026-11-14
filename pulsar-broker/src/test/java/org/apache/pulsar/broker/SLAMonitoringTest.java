@@ -1,4 +1,4 @@
-/**
+/*
  * Licensed to the Apache Software Foundation (ASF) under one
  * or more contributor license agreements.  See the NOTICE file
  * distributed with this work for additional information
@@ -22,6 +22,7 @@ import static org.testng.Assert.assertEquals;
 import static org.testng.Assert.assertNotEquals;
 import static org.testng.Assert.assertTrue;
 import static org.testng.Assert.fail;
+import java.net.URI;
 import java.net.URL;
 import java.util.Collections;
 import java.util.HashSet;
@@ -33,29 +34,27 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
-import lombok.extern.slf4j.Slf4j;
+import lombok.CustomLog;
 import org.apache.pulsar.broker.namespace.NamespaceService;
 import org.apache.pulsar.client.admin.PulsarAdmin;
 import org.apache.pulsar.client.admin.PulsarAdminException;
 import org.apache.pulsar.common.policies.data.ClusterData;
-import org.apache.pulsar.common.policies.data.ClusterDataImpl;
 import org.apache.pulsar.common.policies.data.NamespaceOwnershipStatus;
 import org.apache.pulsar.common.policies.data.TenantInfo;
-import org.apache.pulsar.common.policies.data.TenantInfoImpl;
 import org.apache.pulsar.zookeeper.LocalBookkeeperEnsemble;
 import org.testng.Assert;
 import org.testng.annotations.AfterClass;
 import org.testng.annotations.BeforeClass;
 import org.testng.annotations.Test;
 
-@Slf4j
+@CustomLog
 @Test(groups = "broker")
 public class SLAMonitoringTest {
     LocalBookkeeperEnsemble bkEnsemble;
 
     ExecutorService executor;
 
-    private static final int BROKER_COUNT = 5;
+    private static final int BROKER_COUNT = 3;
     private final int[] brokerWebServicePorts = new int[BROKER_COUNT];
     private final int[] brokerNativeBrokerPorts = new int[BROKER_COUNT];
     private final URL[] brokerUrls = new URL[BROKER_COUNT];
@@ -73,21 +72,25 @@ public class SLAMonitoringTest {
                         new LinkedBlockingQueue<>());
         log.info("---- Initializing SLAMonitoringTest -----");
         // Start local bookkeeper ensemble
-        bkEnsemble = new LocalBookkeeperEnsemble(3, 0, () -> 0);
+        bkEnsemble = new LocalBookkeeperEnsemble(1, 0);
         bkEnsemble.start();
 
         // start brokers
         for (int i = 0; i < BROKER_COUNT; i++) {
             ServiceConfiguration config = new ServiceConfiguration();
             config.setBrokerShutdownTimeoutMs(0L);
+            config.setLoadBalancerOverrideBrokerNicSpeedGbps(Optional.of(1.0d));
             config.setBrokerServicePort(Optional.of(0));
             config.setBrokerShutdownTimeoutMs(0L);
             config.setClusterName("my-cluster");
             config.setAdvertisedAddress("localhost");
             config.setWebServicePort(Optional.of(0));
-            config.setZookeeperServers("127.0.0.1" + ":" + bkEnsemble.getZookeeperPort());
+            config.setMetadataStoreUrl("zk:127.0.0.1:" + bkEnsemble.getZookeeperPort());
             config.setDefaultNumberOfNamespaceBundles(1);
             config.setLoadBalancerEnabled(false);
+            config.setManagedLedgerDefaultEnsembleSize(1);
+            config.setManagedLedgerDefaultWriteQuorum(1);
+            config.setManagedLedgerDefaultAckQuorum(1);
             configurations[i] = config;
 
             pulsarServices[i] = new PulsarService(config);
@@ -95,7 +98,7 @@ public class SLAMonitoringTest {
 
             brokerWebServicePorts[i] = pulsarServices[i].getListenPortHTTP().get();
             brokerNativeBrokerPorts[i] = pulsarServices[i].getBrokerListenPort().get();
-            brokerUrls[i] = new URL(pulsarServices[i].getWebServiceAddress());
+            brokerUrls[i] = URI.create(pulsarServices[i].getWebServiceAddress()).toURL();
             pulsarAdmins[i] = PulsarAdmin.builder().serviceHttpUrl(brokerUrls[i].toString()).build();
         }
 
@@ -103,9 +106,9 @@ public class SLAMonitoringTest {
 
         createTenant(pulsarAdmins[BROKER_COUNT - 1]);
         for (int i = 0; i < BROKER_COUNT; i++) {
-            String topic = String.format("%s/%s/%s:%s", NamespaceService.SLA_NAMESPACE_PROPERTY, "my-cluster",
-                    pulsarServices[i].getAdvertisedAddress(), brokerWebServicePorts[i]);
-            pulsarAdmins[0].namespaces().createNamespace(topic);
+            var namespaceName = NamespaceService.getSLAMonitorNamespace(pulsarServices[i].getBrokerId(),
+                    pulsarServices[i].getConfig());
+            pulsarAdmins[0].namespaces().createNamespace(namespaceName.toString());
         }
     }
 
@@ -127,15 +130,26 @@ public class SLAMonitoringTest {
     @AfterClass(alwaysRun = true)
     public void shutdown() throws Exception {
         log.info("--- Shutting down ---");
-        executor.shutdownNow();
-        executor = null;
-
-        for (int i = 0; i < BROKER_COUNT; i++) {
-            pulsarAdmins[i].close();
-            pulsarServices[i].close();
+        if (executor != null) {
+            executor.shutdownNow();
+            executor = null;
         }
 
-        bkEnsemble.stop();
+        for (int i = 0; i < BROKER_COUNT; i++) {
+            if (pulsarAdmins[i] != null) {
+                pulsarAdmins[i].close();
+                pulsarAdmins[i] = null;
+            }
+            if (pulsarServices[i] != null) {
+                pulsarServices[i].close();
+                pulsarServices[i] = null;
+            }
+        }
+
+        if (bkEnsemble != null) {
+            bkEnsemble.stop();
+            bkEnsemble = null;
+        }
     }
 
     @Test
@@ -145,7 +159,7 @@ public class SLAMonitoringTest {
                 assertTrue(pulsarServices[0].getNamespaceService().registerSLANamespace());
             } catch (PulsarServerException e) {
                 e.printStackTrace();
-                log.error("Exception occurred", e);
+                log.error().exception(e).log("Exception occurred");
                 fail("SLA Namespace should have been owned by the broker, Exception.", e);
             }
         }
@@ -162,7 +176,7 @@ public class SLAMonitoringTest {
 
                 Map<String, NamespaceOwnershipStatus> nsMap = pulsarAdmins[i].brokers().getOwnedNamespaces("my-cluster",
                         list.get(0));
-                Assert.assertEquals(nsMap.size(), 3);
+                Assert.assertEquals(nsMap.size(), 2);
             }
         } catch (Exception e) {
             e.printStackTrace();
@@ -174,9 +188,9 @@ public class SLAMonitoringTest {
     public void testOwnershipViaAdminAfterSetup() {
         for (int i = 0; i < BROKER_COUNT; i++) {
             try {
-                String topic = String.format("persistent://%s/%s/%s:%s/%s",
-                        NamespaceService.SLA_NAMESPACE_PROPERTY, "my-cluster", pulsarServices[i].getAdvertisedAddress(),
-                        brokerWebServicePorts[i], "my-topic");
+                String topic = String.format("persistent://%s/%s/%s",
+                        NamespaceService.SLA_NAMESPACE_PROPERTY,
+                        pulsarServices[i].getBrokerId(), "my-topic");
                 assertEquals(pulsarAdmins[0].lookups().lookupTopic(topic),
                         "pulsar://" + pulsarServices[i].getAdvertisedAddress() + ":" + brokerNativeBrokerPorts[i]);
             } catch (Exception e) {
@@ -191,7 +205,7 @@ public class SLAMonitoringTest {
     @Test
     public void testUnloadIfBrokerCrashes() {
         int crashIndex = BROKER_COUNT / 2;
-        log.info("Trying to close the broker at index = {}", crashIndex);
+        log.info().attr("crashIndex", crashIndex).log("Trying to close the broker");
 
         try {
             pulsarServices[crashIndex].close();
@@ -200,16 +214,16 @@ public class SLAMonitoringTest {
             fail("Should be a able to close the broker index " + crashIndex + " Exception: " + e);
         }
 
-        String topic = String.format("persistent://%s/%s/%s:%s/%s", NamespaceService.SLA_NAMESPACE_PROPERTY,
-                "my-cluster", pulsarServices[crashIndex].getAdvertisedAddress(), brokerWebServicePorts[crashIndex],
+        String topic = String.format("persistent://%s/%s/%s", NamespaceService.SLA_NAMESPACE_PROPERTY,
+                pulsarServices[crashIndex].getBrokerId(),
                 "my-topic");
 
-        log.info("Lookup for namespace {}", topic);
+        log.info().attr("topic", topic).log("Lookup for namespace");
 
         String broker = null;
         try {
             broker = pulsarAdmins[BROKER_COUNT - 1].lookups().lookupTopic(topic);
-            log.info("{} Namespace is owned by {}", topic, broker);
+            log.info().attr("topic", topic).attr("broker", broker).log("Namespace is owned by");
             assertNotEquals(broker,
                     "pulsar://" + pulsarServices[crashIndex].getAdvertisedAddress() + ":"
                             + brokerNativeBrokerPorts[crashIndex]);
@@ -232,7 +246,7 @@ public class SLAMonitoringTest {
 
         try {
             broker = pulsarAdmins[0].lookups().lookupTopic(topic);
-            log.info("{} Namespace is re-owned by {}", topic, broker);
+            log.info().attr("topic", topic).attr("broker", broker).log("Namespace is re-owned by");
             assertEquals(broker,
                     "pulsar://" + pulsarServices[crashIndex].getAdvertisedAddress() + ":"
                             + brokerNativeBrokerPorts[crashIndex]);

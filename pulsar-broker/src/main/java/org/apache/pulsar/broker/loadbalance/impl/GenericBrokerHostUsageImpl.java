@@ -1,4 +1,4 @@
-/**
+/*
  * Licensed to the Apache Software Foundation (ASF) under one
  * or more contributor license agreements.  See the NOTICE file
  * distributed with this work for additional information
@@ -18,6 +18,7 @@
  */
 package org.apache.pulsar.broker.loadbalance.impl;
 
+import static org.apache.pulsar.common.util.Runnables.catchingAndLoggingThrowables;
 import com.sun.management.OperatingSystemMXBean;
 import java.lang.management.ManagementFactory;
 import java.util.concurrent.ScheduledExecutorService;
@@ -53,9 +54,10 @@ public class GenericBrokerHostUsageImpl implements BrokerHostUsage {
         this.totalCpuLimit = getTotalCpuLimit();
         // Call now to initialize values before the constructor returns
         calculateBrokerHostUsage();
-        executorService.scheduleAtFixedRate(this::checkCpuLoad, CPU_CHECK_MILLIS,
+        executorService.scheduleWithFixedDelay(catchingAndLoggingThrowables(this::checkCpuLoad), CPU_CHECK_MILLIS,
                 CPU_CHECK_MILLIS, TimeUnit.MILLISECONDS);
-        executorService.scheduleAtFixedRate(this::doCalculateBrokerHostUsage, hostUsageCheckIntervalMin,
+        executorService.scheduleWithFixedDelay(catchingAndLoggingThrowables(this::doCalculateBrokerHostUsage),
+                hostUsageCheckIntervalMin,
                 hostUsageCheckIntervalMin, TimeUnit.MINUTES);
     }
 
@@ -64,6 +66,7 @@ public class GenericBrokerHostUsageImpl implements BrokerHostUsage {
         return usage;
     }
 
+    @SuppressWarnings("deprecation")
     private synchronized void checkCpuLoad() {
         cpuUsageSum += systemBean.getSystemCpuLoad();
         cpuUsageCount++;
@@ -101,6 +104,7 @@ public class GenericBrokerHostUsageImpl implements BrokerHostUsage {
         return new ResourceUsage(getTotalCpuUsage() * totalCpuLimit, totalCpuLimit);
     }
 
+    @SuppressWarnings("deprecation")
     private ResourceUsage getMemUsage() {
         double total = ((double) systemBean.getTotalPhysicalMemorySize()) / (1024 * 1024);
         double free = ((double) systemBean.getFreePhysicalMemorySize()) / (1024 * 1024);

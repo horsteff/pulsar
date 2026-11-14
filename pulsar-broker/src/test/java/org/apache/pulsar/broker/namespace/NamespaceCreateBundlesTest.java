@@ -1,4 +1,4 @@
-/**
+/*
  * Licensed to the Apache Software Foundation (ASF) under one
  * or more contributor license agreements.  See the NOTICE file
  * distributed with this work for additional information
@@ -20,30 +20,33 @@ package org.apache.pulsar.broker.namespace;
 
 import static org.testng.Assert.assertEquals;
 import static org.testng.Assert.assertNotNull;
-
+import static org.testng.Assert.assertTrue;
 import java.util.UUID;
 import java.util.concurrent.TimeUnit;
-
+import java.util.concurrent.atomic.AtomicBoolean;
+import lombok.Cleanup;
 import org.apache.pulsar.broker.service.BrokerTestBase;
 import org.apache.pulsar.client.api.Producer;
 import org.apache.pulsar.client.api.ProducerBuilder;
+import org.apache.pulsar.common.naming.NamespaceBundle;
 import org.apache.pulsar.common.policies.data.BookieAffinityGroupData;
 import org.apache.pulsar.common.policies.data.Policies;
-import org.testng.annotations.AfterMethod;
-import org.testng.annotations.BeforeMethod;
+import org.awaitility.Awaitility;
+import org.testng.annotations.AfterClass;
+import org.testng.annotations.BeforeClass;
 import org.testng.annotations.Test;
 
 @Test(groups = "broker")
 public class NamespaceCreateBundlesTest extends BrokerTestBase {
 
-    @BeforeMethod
+    @BeforeClass(alwaysRun = true)
     @Override
     protected void setup() throws Exception {
         conf.setDefaultNumberOfNamespaceBundles(16);
         super.baseSetup();
     }
 
-    @AfterMethod(alwaysRun = true)
+    @AfterClass(alwaysRun = true)
     @Override
     protected void cleanup() throws Exception {
         super.internalCleanup();
@@ -80,5 +83,33 @@ public class NamespaceCreateBundlesTest extends BrokerTestBase {
         admin.namespaces().splitNamespaceBundle(namespaceName, bundle, false, null);
         assertNotNull(admin.namespaces().getBookieAffinityGroup(namespaceName));
         producer.close();
+    }
+
+    @Test
+    public void testBundleSplitListener() throws Exception {
+        String namespaceName = "prop/" + UUID.randomUUID().toString();
+        String topicName = "persistent://" + namespaceName + "/my-topic5";
+        admin.namespaces().createNamespace(namespaceName);
+        @Cleanup
+        Producer<byte[]> producer = pulsarClient.newProducer().topic(topicName).sendTimeout(1,
+            TimeUnit.SECONDS).create();
+        producer.send(new byte[1]);
+        String bundleRange = admin.lookups().getBundleRange(topicName);
+        AtomicBoolean isTriggered = new AtomicBoolean(false);
+        pulsar.getNamespaceService().addNamespaceBundleSplitListener(new NamespaceBundleSplitListener() {
+            @Override
+            public void onSplit(NamespaceBundle bundle) {
+                assertEquals(bundleRange, bundle.getBundleRange());
+                isTriggered.set(true);
+            }
+
+            @Override
+            public boolean test(NamespaceBundle namespaceBundle) {
+                // the broker is shared by the class's tests, which split bundles of their own namespaces
+                return namespaceBundle.getNamespaceObject().toString().equals(namespaceName);
+            }
+        });
+        admin.namespaces().splitNamespaceBundle(namespaceName, bundleRange, false, null);
+        Awaitility.await().untilAsserted(() -> assertTrue(isTriggered.get()));
     }
 }

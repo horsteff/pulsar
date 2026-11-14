@@ -1,4 +1,4 @@
-/**
+/*
  * Licensed to the Apache Software Foundation (ASF) under one
  * or more contributor license agreements.  See the NOTICE file
  * distributed with this work for additional information
@@ -19,18 +19,20 @@
 package org.apache.pulsar.client.impl;
 
 import com.google.common.collect.Sets;
-
+import java.time.Duration;
 import org.apache.pulsar.broker.auth.MockedPulsarServiceBaseTest;
 import org.apache.pulsar.client.api.MessageId;
 import org.apache.pulsar.client.api.Producer;
 import org.apache.pulsar.client.api.Reader;
 import org.apache.pulsar.client.api.Schema;
-
+import org.apache.pulsar.common.naming.TopicName;
 import org.apache.pulsar.common.policies.data.ClusterData;
-import org.apache.pulsar.common.policies.data.ClusterDataImpl;
 import org.apache.pulsar.common.policies.data.SchemaAutoUpdateCompatibilityStrategy;
 import org.apache.pulsar.common.policies.data.TenantInfoImpl;
-
+import org.apache.pulsar.common.schema.SchemaInfo;
+import org.apache.pulsar.common.schema.SchemaType;
+import org.awaitility.Awaitility;
+import org.testng.Assert;
 import org.testng.annotations.AfterMethod;
 import org.testng.annotations.BeforeMethod;
 import org.testng.annotations.Test;
@@ -57,6 +59,7 @@ public class SchemaDeleteTest extends MockedPulsarServiceBaseTest {
     protected void cleanup() throws Exception {
         super.internalCleanup();
     }
+    @SuppressWarnings("deprecation")
 
     @Test
     public void createTopicDeleteTopicCreateTopic() throws Exception {
@@ -88,6 +91,45 @@ public class SchemaDeleteTest extends MockedPulsarServiceBaseTest {
         // shouldn't check against those that were there before we deleted the schema.
         try (Reader<DummyPojo> reader = pulsarClient.newReader(Schema.AVRO(DummyPojo.class))
                 .topic(topic).startMessageId(MessageId.latest).create()) {
+        }
+    }
+
+    @Test
+    public void schemaForceDeleteTest() throws Exception {
+        String namespace = "my-property/my-ns";
+        String topic = namespace + "/topic1";
+        String foobar = "foo";
+
+        try (Producer<String> producer =
+                     pulsarClient.newProducer(Schema.STRING).topic(topic).create()) {
+            producer.send(foobar);
+        }
+        SchemaInfo schemaInfo = admin.schemas().getSchemaInfo(topic);
+        Assert.assertSame(schemaInfo.getType(), SchemaType.STRING);
+
+        String schemaPath = "/schemas/" + TopicName.get(topic).getSchemaName();
+
+        admin.schemas().deleteSchema(topic, false);
+        Assert.assertTrue(pulsar.getLocalMetadataStore().get(schemaPath).get().isPresent());
+        admin.schemas().deleteSchema(topic, true);
+        Assert.assertFalse(pulsar.getLocalMetadataStore().get(schemaPath).get().isPresent());
+    }
+
+    @Test
+    public void testDeleteSchemaWhileAutoProduceProducerIsConnected() throws Exception {
+        String topic = "my-property/my-ns/auto-produce-bytes-delete-schema";
+        admin.schemas().createSchema(topic, Schema.AVRO(DummyPojo.class).getSchemaInfo());
+
+        try (Producer<byte[]> producer = pulsarClient.newProducer(Schema.AUTO_PRODUCE_BYTES()).topic(topic).create()) {
+            Awaitility.await().atMost(Duration.ofSeconds(5)).until(producer::isConnected);
+            ProducerImpl<byte[]> producerImpl = (ProducerImpl<byte[]>) producer;
+            long connectionEpoch = producerImpl.getConnectionHandler().getEpoch();
+            admin.schemas().deleteSchema(topic);
+            admin.topics().unload(topic);
+
+            Awaitility.await().atMost(Duration.ofSeconds(10)).until(() ->
+                    producerImpl.getConnectionHandler().getEpoch() > connectionEpoch && producer.isConnected());
+            Assert.assertTrue(admin.schemas().getAllSchemas(topic).isEmpty());
         }
     }
 

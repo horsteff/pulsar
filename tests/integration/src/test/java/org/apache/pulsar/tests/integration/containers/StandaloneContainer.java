@@ -1,4 +1,4 @@
-/**
+/*
  * Licensed to the Apache Software Foundation (ASF) under one
  * or more contributor license agreements.  See the NOTICE file
  * distributed with this work for additional information
@@ -19,7 +19,6 @@
 package org.apache.pulsar.tests.integration.containers;
 
 import static java.time.temporal.ChronoUnit.SECONDS;
-
 import java.time.Duration;
 import org.testcontainers.containers.wait.strategy.HttpWaitStrategy;
 
@@ -64,14 +63,7 @@ public class StandaloneContainer extends PulsarContainer<StandaloneContainer> {
                 .forPort(BROKER_HTTP_PORT)
                 .forStatusCode(200)
                 .forPath("/admin/v2/namespaces/public/default")
+                .withRateLimiter(newHttpWaitRateLimiter())
                 .withStartupTimeout(Duration.of(300, SECONDS));
-    }
-
-    public String getPlainTextServiceUrl() {
-        return "pulsar://" + getContainerIpAddress() + ":" + getMappedPort(BROKER_PORT);
-    }
-
-    public String getHttpServiceUrl() {
-        return "http://" + getContainerIpAddress() + ":" + getMappedPort(BROKER_HTTP_PORT);
     }
 }

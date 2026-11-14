@@ -1,4 +1,4 @@
-/**
+/*
  * Licensed to the Apache Software Foundation (ASF) under one
  * or more contributor license agreements.  See the NOTICE file
  * distributed with this work for additional information
@@ -18,7 +18,6 @@
  */
 package org.apache.pulsar.functions.worker;
 
-import com.google.common.annotations.VisibleForTesting;
 import java.io.IOException;
 import java.util.Collection;
 import java.util.LinkedList;
@@ -28,8 +27,8 @@ import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.function.Supplier;
+import lombok.CustomLog;
 import lombok.Getter;
-import lombok.extern.slf4j.Slf4j;
 import org.apache.pulsar.client.api.Message;
 import org.apache.pulsar.client.api.MessageId;
 import org.apache.pulsar.client.api.Producer;
@@ -37,9 +36,9 @@ import org.apache.pulsar.client.api.PulsarClient;
 import org.apache.pulsar.client.api.PulsarClientException;
 import org.apache.pulsar.client.api.Reader;
 import org.apache.pulsar.client.api.TypedMessageBuilder;
-import org.apache.pulsar.functions.proto.Function;
-import org.apache.pulsar.functions.proto.Function.FunctionMetaData;
-import org.apache.pulsar.functions.proto.Request;
+import org.apache.pulsar.functions.proto.FunctionDetails;
+import org.apache.pulsar.functions.proto.FunctionMetaData;
+import org.apache.pulsar.functions.proto.ServiceRequest;
 import org.apache.pulsar.functions.utils.FunctionCommon;
 
 /**
@@ -58,11 +57,10 @@ import org.apache.pulsar.functions.utils.FunctionCommon;
  * If a worker loses its leadership, it calls giveupLeaderShip at which time the
  * manager closes its exclusive producer and starts its tailer again.
  */
-@Slf4j
+@CustomLog
 public class FunctionMetaDataManager implements AutoCloseable {
     // Represents the global state
     // tenant -> namespace -> (function name, FunctionRuntimeInfo)
-    @VisibleForTesting
     final Map<String, Map<String, Map<String, FunctionMetaData>>> functionMetaDataMap = new ConcurrentHashMap<>();
 
     private final SchedulerManager schedulerManager;
@@ -74,7 +72,7 @@ public class FunctionMetaDataManager implements AutoCloseable {
     // The producer of the metadata topic when we are the leader.
     // Note that this variable serves a double duty. A non-null value
     // implies we are the leader, while a null value means we are not the leader
-    private Producer exclusiveLeaderProducer;
+    private volatile Producer<byte[]> exclusiveLeaderProducer;
     @Getter
     private volatile MessageId lastMessageSeen = MessageId.earliest;
 
@@ -94,7 +92,7 @@ public class FunctionMetaDataManager implements AutoCloseable {
         exclusiveLeaderProducer = null;
     }
 
-    /**
+    /*
      * Public methods. Please use these methods if references FunctionMetaManager from an external class
      */
 
@@ -103,7 +101,7 @@ public class FunctionMetaDataManager implements AutoCloseable {
      * We create a new reader
      */
     public synchronized void initialize() {
-        try (Reader reader = FunctionMetaDataTopicTailer.createReader(
+        try (Reader<byte[]> reader = FunctionMetaDataTopicTailer.createReader(
                 workerConfig, pulsarClient.newReader(), MessageId.earliest)) {
             // read all existing messages
             while (reader.hasMessageAvailable()) {
@@ -111,7 +109,7 @@ public class FunctionMetaDataManager implements AutoCloseable {
             }
             this.isInitialized.complete(null);
         } catch (Exception e) {
-            log.error("Failed to initialize meta data store", e);
+            log.error().exception(e).log("Failed to initialize meta data store");
             throw new RuntimeException("Failed to initialize Metadata Manager", e);
         }
         log.info("FunctionMetaData Manager initialization complete");
@@ -140,7 +138,7 @@ public class FunctionMetaDataManager implements AutoCloseable {
     }
 
     /**
-     * Get the function metadata for a function
+     * Get the function metadata for a function.
      * @param tenant the tenant the function belongs to
      * @param namespace the namespace the function belongs to
      * @param functionName the function name
@@ -151,7 +149,7 @@ public class FunctionMetaDataManager implements AutoCloseable {
     }
 
     /**
-     * Get a list of all the meta for every function
+     * Get a list of all the meta for every function.
      * @return list of function metadata
      */
     public synchronized List<FunctionMetaData> getAllFunctionMetaData() {
@@ -165,7 +163,7 @@ public class FunctionMetaDataManager implements AutoCloseable {
     }
 
     /**
-     * List all the functions in a namespace
+     * List all the functions in a namespace.
      * @param tenant the tenant the namespace belongs to
      * @param namespace the namespace
      * @return a list of function names
@@ -187,7 +185,7 @@ public class FunctionMetaDataManager implements AutoCloseable {
     }
 
     /**
-     * Check if the function exists
+     * Check if the function exists.
      * @param tenant tenant that the function belongs to
      * @param namespace namespace that the function belongs to
      * @param functionName name of function
@@ -222,17 +220,16 @@ public class FunctionMetaDataManager implements AutoCloseable {
                 toWrite = functionMetaData.toByteArray();
             }
         } else {
-            Request.ServiceRequest serviceRequest = Request.ServiceRequest.newBuilder()
-                    .setServiceRequestType(delete ? Request.ServiceRequest.ServiceRequestType.DELETE
-                            : Request.ServiceRequest.ServiceRequestType.UPDATE)
-                    .setFunctionMetaData(functionMetaData)
-                    .setWorkerId(workerConfig.getWorkerId())
-                    .setRequestId(UUID.randomUUID().toString())
-                    .build();
+            ServiceRequest serviceRequest = new ServiceRequest();
+            serviceRequest.setServiceRequestType(delete ? ServiceRequest.ServiceRequestType.DELETE
+                            : ServiceRequest.ServiceRequestType.UPDATE);
+            serviceRequest.setFunctionMetaData().copyFrom(functionMetaData);
+            serviceRequest.setWorkerId(workerConfig.getWorkerId());
+            serviceRequest.setRequestId(UUID.randomUUID().toString());
             toWrite = serviceRequest.toByteArray();
         }
         try {
-            TypedMessageBuilder builder = exclusiveLeaderProducer.newMessage()
+            TypedMessageBuilder<byte[]> builder = exclusiveLeaderProducer.newMessage()
                     .value(toWrite)
                     .property(versionTag, Long.toString(functionMetaData.getVersion()));
             if (workerConfig.getUseCompactedMetadataTopic()) {
@@ -240,12 +237,12 @@ public class FunctionMetaDataManager implements AutoCloseable {
             }
             lastMessageSeen = builder.send();
             if (delete) {
-                needsScheduling = proccessDeregister(functionMetaData);
+                needsScheduling = processDeregister(functionMetaData);
             } else {
                 needsScheduling = processUpdate(functionMetaData);
             }
         } catch (Exception e) {
-            log.error("Could not write into Function Metadata topic", e);
+            log.error().exception(e).log("Could not write into Function Metadata topic");
             throw new IllegalStateException("Internal Error updating function at the leader", e);
         }
 
@@ -255,13 +252,14 @@ public class FunctionMetaDataManager implements AutoCloseable {
     }
 
     private void checkRequestOutDated(FunctionMetaData functionMetaData, boolean delete) {
-        Function.FunctionDetails details = functionMetaData.getFunctionDetails();
+        FunctionDetails details = functionMetaData.getFunctionDetails();
         if (isRequestOutdated(details.getTenant(), details.getNamespace(),
                 details.getName(), functionMetaData.getVersion())) {
-            if (log.isDebugEnabled()) {
-                log.debug("{}/{}/{} Ignoring outdated request version: {}", details.getTenant(), details.getNamespace(),
-                        details.getName(), functionMetaData.getVersion());
-            }
+            log.debug().attr("tenant", details.getTenant())
+                    .attr("namespace", details.getNamespace())
+                    .attr("functionName", details.getName())
+                    .attr("version", functionMetaData.getVersion())
+                    .log("Ignoring outdated request version");
             if (delete) {
                 throw new IllegalArgumentException(
                         "Delete request ignored because it is out of date. Please try again.");
@@ -306,7 +304,7 @@ public class FunctionMetaDataManager implements AutoCloseable {
             try {
                 tailer.stopWhenNoMoreMessages().get();
             } catch (Exception e) {
-                log.error("Error while waiting for metadata tailer thread to finish", e);
+                log.error().exception(e).log("Error while waiting for metadata tailer thread to finish");
                 errorNotifier.triggerError(e);
             }
             tailer.close();
@@ -325,7 +323,7 @@ public class FunctionMetaDataManager implements AutoCloseable {
             exclusiveLeaderProducer = null;
             initializeTailer();
         } catch (PulsarClientException e) {
-            log.error("Error closing exclusive producer", e);
+            log.error().exception(e).log("Error closing exclusive producer");
             errorNotifier.triggerError(e);
         }
     }
@@ -350,32 +348,36 @@ public class FunctionMetaDataManager implements AutoCloseable {
     }
 
     private void processUncompactedMetaDataTopicMessage(Message<byte[]> message) throws IOException {
-        Request.ServiceRequest serviceRequest = Request.ServiceRequest.parseFrom(message.getData());
-        if (log.isDebugEnabled()) {
-            log.debug("Received Service Request: {}", serviceRequest);
-        }
+        ServiceRequest serviceRequest = new ServiceRequest();
+        serviceRequest.parseFrom(io.netty.buffer.Unpooled.wrappedBuffer(message.getData()),
+                message.getData().length);
+        log.debug().attr("serviceRequest", serviceRequest)
+                .log("Received Service Request");
         switch (serviceRequest.getServiceRequestType()) {
             case UPDATE:
                 this.processUpdate(serviceRequest.getFunctionMetaData());
                 break;
             case DELETE:
-                this.proccessDeregister(serviceRequest.getFunctionMetaData());
+                this.processDeregister(serviceRequest.getFunctionMetaData());
                 break;
             default:
-                log.warn("Received request with unrecognized type: {}", serviceRequest);
+                log.warn().attr("serviceRequest", serviceRequest)
+                        .log("Received request with unrecognized type");
         }
     }
 
     private void processCompactedMetaDataTopicMessage(Message<byte[]> message) throws IOException {
-        long version = Long.valueOf(message.getProperty(versionTag));
+        long version = Long.parseLong(message.getProperty(versionTag));
         String tenant = FunctionCommon.extractTenantFromFullyQualifiedName(message.getKey());
         String namespace = FunctionCommon.extractNamespaceFromFullyQualifiedName(message.getKey());
         String functionName = FunctionCommon.extractNameFromFullyQualifiedName(message.getKey());
         if (message.getData() == null || message.getData().length == 0) {
             // this is a delete message
-            this.proccessDeregister(tenant, namespace, functionName, version);
+            this.processDeregister(tenant, namespace, functionName, version);
         } else {
-            FunctionMetaData functionMetaData = FunctionMetaData.parseFrom(message.getData());
+            FunctionMetaData functionMetaData = new FunctionMetaData();
+            functionMetaData.parseFrom(io.netty.buffer.Unpooled.wrappedBuffer(message.getData()),
+                    message.getData().length);
             this.processUpdate(functionMetaData);
         }
     }
@@ -388,7 +390,7 @@ public class FunctionMetaDataManager implements AutoCloseable {
         return containsFunctionMetaData(functionMetaData.getFunctionDetails());
     }
 
-    private boolean containsFunctionMetaData(Function.FunctionDetails functionDetails) {
+    private boolean containsFunctionMetaData(FunctionDetails functionDetails) {
         return containsFunctionMetaData(
                 functionDetails.getTenant(), functionDetails.getNamespace(), functionDetails.getName());
     }
@@ -404,20 +406,22 @@ public class FunctionMetaDataManager implements AutoCloseable {
         return false;
     }
 
-    @VisibleForTesting
-    synchronized boolean proccessDeregister(FunctionMetaData deregisterRequestFs) throws IllegalArgumentException {
+    synchronized boolean processDeregister(FunctionMetaData deregisterRequestFs) throws IllegalArgumentException {
         String functionName = deregisterRequestFs.getFunctionDetails().getName();
         String tenant = deregisterRequestFs.getFunctionDetails().getTenant();
         String namespace = deregisterRequestFs.getFunctionDetails().getNamespace();
-        return proccessDeregister(tenant, namespace, functionName, deregisterRequestFs.getVersion());
+        return processDeregister(tenant, namespace, functionName, deregisterRequestFs.getVersion());
     }
 
-    synchronized boolean proccessDeregister(String tenant, String namespace,
-                                            String functionName, long version) throws IllegalArgumentException {
+    synchronized boolean processDeregister(String tenant, String namespace,
+                                           String functionName, long version) throws IllegalArgumentException {
 
         boolean needsScheduling = false;
-
-        log.debug("Process deregister request: {}/{}/{}/{}", tenant, namespace, functionName, version);
+        log.debug().attr("tenant", tenant)
+                .attr("namespace", namespace)
+                .attr("functionName", functionName)
+                .attr("version", version)
+                .log("Process deregister request");
 
         // Check if we still have this function. Maybe already deleted by someone else
         if (this.containsFunctionMetaData(tenant, namespace, functionName)) {
@@ -426,21 +430,23 @@ public class FunctionMetaDataManager implements AutoCloseable {
                 this.functionMetaDataMap.get(tenant).get(namespace).remove(functionName);
                 needsScheduling = true;
             } else {
-                if (log.isDebugEnabled()) {
-                    log.debug("{}/{}/{} Ignoring outdated request version: {}", tenant, namespace, functionName,
-                            version);
-                }
-                throw new IllegalArgumentException("Delete request ignored because it is out of date. Please try again.");
+                log.debug().attr("tenant", tenant)
+                        .attr("namespace", namespace)
+                        .attr("functionName", functionName)
+                        .attr("version", version)
+                        .log("Ignoring outdated request version");
+                throw new IllegalArgumentException("Delete request ignored because "
+                        + "it is out of date. Please try again.");
             }
         }
 
         return needsScheduling;
     }
 
-    @VisibleForTesting
     synchronized boolean processUpdate(FunctionMetaData updateRequestFs) throws IllegalArgumentException {
 
-        log.debug("Process update request: {}", updateRequestFs);
+        log.debug().attr("updateRequest", updateRequestFs)
+                .log("Process update request");
 
         boolean needsScheduling = false;
 
@@ -458,7 +464,8 @@ public class FunctionMetaDataManager implements AutoCloseable {
                 setFunctionMetaData(updateRequestFs);
                 needsScheduling = true;
             } else {
-                throw new IllegalArgumentException("Update request ignored because it is out of date. Please try again.");
+                throw new IllegalArgumentException("Update request "
+                        + "ignored because it is out of date. Please try again.");
             }
         }
 
@@ -466,14 +473,14 @@ public class FunctionMetaDataManager implements AutoCloseable {
     }
 
     private boolean isRequestOutdated(FunctionMetaData requestFunctionMetaData) {
-        Function.FunctionDetails functionDetails = requestFunctionMetaData.getFunctionDetails();
+        FunctionDetails functionDetails = requestFunctionMetaData.getFunctionDetails();
         return isRequestOutdated(functionDetails.getTenant(), functionDetails.getNamespace(),
                 functionDetails.getName(), requestFunctionMetaData.getVersion());
     }
 
     private boolean isRequestOutdated(String tenant, String namespace, String functionName, long version) {
         // avoid NPE
-        if(!containsFunctionMetaData(tenant, namespace, functionName)){
+        if (!containsFunctionMetaData(tenant, namespace, functionName)) {
             return false;
         }
         FunctionMetaData currentFunctionMetaData = this.functionMetaDataMap.get(tenant)
@@ -481,9 +488,8 @@ public class FunctionMetaDataManager implements AutoCloseable {
         return currentFunctionMetaData.getVersion() >= version;
     }
 
-    @VisibleForTesting
     void setFunctionMetaData(FunctionMetaData functionMetaData) {
-        Function.FunctionDetails functionDetails = functionMetaData.getFunctionDetails();
+        FunctionDetails functionDetails = functionMetaData.getFunctionDetails();
         if (!this.functionMetaDataMap.containsKey(functionDetails.getTenant())) {
             this.functionMetaDataMap.put(functionDetails.getTenant(), new ConcurrentHashMap<>());
         }

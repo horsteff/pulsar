@@ -1,0 +1,306 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+package org.apache.pulsar.testclient;
+
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.testng.Assert.fail;
+import com.google.common.collect.Sets;
+import java.net.URI;
+import java.time.Duration;
+import java.util.List;
+import java.util.UUID;
+import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.atomic.AtomicInteger;
+import lombok.Cleanup;
+import lombok.CustomLog;
+import org.apache.pulsar.broker.ServiceConfiguration;
+import org.apache.pulsar.broker.auth.MockedPulsarServiceBaseTest;
+import org.apache.pulsar.client.api.v5.Message;
+import org.apache.pulsar.client.api.v5.Producer;
+import org.apache.pulsar.client.api.v5.PulsarClient;
+import org.apache.pulsar.client.api.v5.PulsarClientException;
+import org.apache.pulsar.client.api.v5.QueueConsumer;
+import org.apache.pulsar.client.api.v5.Transaction;
+import org.apache.pulsar.client.api.v5.config.SubscriptionInitialPosition;
+import org.apache.pulsar.client.api.v5.config.TransactionPolicy;
+import org.apache.pulsar.client.api.v5.schema.Schema;
+import org.apache.pulsar.common.naming.NamespaceName;
+import org.apache.pulsar.common.naming.SystemTopicNames;
+import org.apache.pulsar.common.partition.PartitionedTopicMetadata;
+import org.apache.pulsar.common.policies.data.ClusterData;
+import org.apache.pulsar.common.policies.data.TenantInfoImpl;
+import org.testng.Assert;
+import org.testng.annotations.AfterClass;
+import org.testng.annotations.AfterMethod;
+import org.testng.annotations.BeforeClass;
+import org.testng.annotations.BeforeMethod;
+import org.testng.annotations.Test;
+
+/**
+ * The perf transaction tools target the scalable-topics (v5) coordinator, which is transaction-aware
+ * only for scalable {@code topic://} topics (PIP-473). These tests therefore pre-create scalable
+ * topics and verify with a v5 SDK client (the v4 SDK can't produce/consume on scalable topics). The
+ * tools themselves are unchanged — they just receive {@code topic://} names of pre-created topics.
+ */
+@CustomLog
+public class PerformanceTransactionTest extends MockedPulsarServiceBaseTest {
+    private final String testTenant = "pulsar";
+    private final String testNamespace = "perf";
+    private final String myNamespace = testTenant + "/" + testNamespace;
+    // v5 transactions are scalable-topic-only; scalable topics use the topic:// domain.
+    private final String testTopic = "topic://" + myNamespace + "/test-";
+    private final AtomicInteger lastExitCode = new AtomicInteger(0);
+
+    // v5 SDK verification client: v5 transactions are scalable-topic-only, and the v4 SDK can't
+    // produce/consume on scalable (topic://) topics.
+    private PulsarClient v5Client;
+
+    // The tests share a broker: each one uses topics of its own
+    @BeforeClass
+    @Override
+    protected void setup() throws Exception {
+        ServiceConfiguration serviceConfiguration = getDefaultConf();
+        serviceConfiguration.setTopicLevelPoliciesEnabled(false);
+        serviceConfiguration.setTransactionCoordinatorEnabled(true);
+        super.internalSetup(serviceConfiguration);
+        // Every send and every transactional ack is an add to the mock BookKeeper, which sleeps 1 ms for each by
+        // default
+        pulsarTestContext.getMockBookKeeper().setDefaultAddEntryDelayMillis(0);
+        PerfClientUtils.setExitProcedure(code -> {
+            log.error().attr("code", code).log("JVM exit code is");
+            if (code != 0) {
+                throw new RuntimeException("JVM should exit with code " + code);
+            }
+        });
+        // Setup namespaces
+        admin.clusters().createCluster("test", ClusterData.builder().serviceUrl(pulsar.getWebServiceAddress()).build());
+        admin.tenants().createTenant(NamespaceName.SYSTEM_NAMESPACE.getTenant(),
+                new TenantInfoImpl(Sets.newHashSet("appid1"), Sets.newHashSet("test")));
+        admin.namespaces().createNamespace(myNamespace, Sets.newHashSet("test"));
+        admin.namespaces().createNamespace(NamespaceName.SYSTEM_NAMESPACE.toString());
+        pulsar.getPulsarResources().getNamespaceResources().getPartitionedTopicResources()
+                .createPartitionedTopic(SystemTopicNames.TRANSACTION_COORDINATOR_ASSIGN,
+                        new PartitionedTopicMetadata(1));
+    }
+
+    @AfterClass(alwaysRun = true)
+    @Override
+    protected void cleanup() throws Exception {
+        super.internalCleanup();
+        int exitCode = lastExitCode.get();
+        if (exitCode != 0) {
+            fail("Unexpected JVM exit code " + exitCode);
+        }
+    }
+
+    // A verification client per test, whose close also closes the consumers a test leaves open
+    @BeforeMethod
+    public void createV5Client() throws Exception {
+        // transactionPolicy(...) opts the verification client into transactions and routes it to the
+        // scalable-topics (v5) coordinator.
+        v5Client = PulsarClient.builder()
+                .serviceUrl(pulsar.getBrokerServiceUrl())
+                .transactionPolicy(TransactionPolicy.builder().timeout(Duration.ofMinutes(5)).build())
+                .build();
+    }
+
+    @AfterMethod(alwaysRun = true)
+    public void closeV5Client() throws Exception {
+        if (v5Client != null) {
+            v5Client.close();
+            v5Client = null;
+        }
+    }
+
+    @Test
+    public void testTxnPerf() throws Exception {
+        String argString = "--topics-c %s --topics-p %s -threads 1 -ntxn 50 -u %s -ss %s --scalable -au %s";
+        String testConsumeTopic = testTopic + UUID.randomUUID();
+        String testProduceTopic = testTopic + UUID.randomUUID();
+        String testSub = "testSub";
+        String args = String.format(argString, testConsumeTopic, testProduceTopic,
+                pulsar.getBrokerServiceUrl(), testSub, URI.create(pulsar.getWebServiceAddress()).toURL());
+
+        // Scalable topics must be pre-created (they don't auto-create on produce).
+        admin.scalableTopics().createScalableTopic(testConsumeTopic, 1);
+        admin.scalableTopics().createScalableTopic(testProduceTopic, 1);
+
+        Producer<byte[]> produceToConsumeTopic = v5Client.newProducer(Schema.bytes())
+                .topic(testConsumeTopic)
+                .create();
+        v5Client.newQueueConsumer(Schema.bytes())
+                .topic(testConsumeTopic)
+                .subscriptionName(testSub + "pre")
+                .subscriptionInitialPosition(SubscriptionInitialPosition.EARLIEST)
+                .subscribe();
+        for (int i = 0; i < 50; i++) {
+            produceToConsumeTopic.newMessage().value(("testConsume " + i).getBytes()).send();
+        }
+
+        Thread thread = new Thread(() -> {
+            try {
+                new PerformanceTransaction().run(args.split(" "));
+            } catch (Exception e) {
+                e.printStackTrace();
+            }
+        });
+        thread.start();
+        thread.join();
+
+        QueueConsumer<byte[]> consumeFromConsumeTopic = v5Client.newQueueConsumer(Schema.bytes())
+                .topic(testConsumeTopic)
+                .subscriptionName(testSub)
+                .subscriptionInitialPosition(SubscriptionInitialPosition.EARLIEST)
+                .subscribe();
+        QueueConsumer<byte[]> consumeFromProduceTopic = v5Client.newQueueConsumer(Schema.bytes())
+                .topic(testProduceTopic)
+                .subscriptionName(testSub)
+                .subscriptionInitialPosition(SubscriptionInitialPosition.EARLIEST)
+                .subscribe();
+        for (int i = 0; i < 50; i++) {
+            Message<byte[]> message = consumeFromProduceTopic.receive(Duration.ofSeconds(10));
+            Assert.assertNotNull(message);
+            consumeFromProduceTopic.acknowledge(message.id());
+        }
+        Message<byte[]> message = consumeFromConsumeTopic.receive(Duration.ofSeconds(2));
+        Assert.assertNull(message);
+        message = consumeFromProduceTopic.receive(Duration.ofSeconds(2));
+        Assert.assertNull(message);
+    }
+
+    @Test
+    public void testProduceTxnMessage() throws Exception {
+        String argString = "%s -r 1000 -u %s -m %d -txn";
+        String topic = testTopic + UUID.randomUUID();
+        int totalMessage = 100;
+        String args = String.format(argString, topic, pulsar.getBrokerServiceUrl(), totalMessage);
+
+        admin.scalableTopics().createScalableTopic(topic, 1);
+
+        @Cleanup
+        QueueConsumer<byte[]> subscribe = v5Client.newQueueConsumer(Schema.bytes())
+                .subscriptionName("subName" + "pre")
+                .topic(topic)
+                .subscriptionInitialPosition(SubscriptionInitialPosition.EARLIEST)
+                .subscribe();
+        PerformanceProducer arguments = new PerformanceProducer();
+        arguments.parse(args.split(" "));
+        arguments.validate();
+        TransactionRecordingProducer producer = new TransactionRecordingProducer(arguments);
+        producer.run();
+
+        // 100 messages fill two transactions of 50 (the -nmt default). run() returns only once the
+        // producer has ended every transaction it opened and counted the outcome.
+        assertThat(producer.transactions)
+                .extracting(Transaction::state)
+                .as("states of the transactions the producer opened")
+                .containsExactly(Transaction.State.COMMITTED, Transaction.State.COMMITTED);
+        assertThat(producer.getTransactionsEndedSuccessfully())
+                .as("transaction ends reported as successful")
+                .isEqualTo(2);
+
+        @Cleanup
+        QueueConsumer<byte[]> consumer = v5Client.newQueueConsumer(Schema.bytes())
+                .subscriptionName("subName")
+                .topic(topic)
+                .subscriptionInitialPosition(SubscriptionInitialPosition.EARLIEST)
+                .subscribe();
+        for (int i = 0; i < totalMessage; i++) {
+            Message<byte[]> message = consumer.receive(Duration.ofSeconds(10));
+            assertThat(message).as("committed message %d", i).isNotNull();
+            consumer.acknowledge(message.id());
+        }
+        Message<byte[]> message = consumer.receive(Duration.ofSeconds(2));
+        Assert.assertNull(message);
+    }
+
+    @Test
+    public void testConsumeTxnMessage() throws Exception {
+        // A long transaction timeout (-tto) so none of the consumer's transactions time out and abort
+        // on the slower scalable-topic path: an aborted txn would release its pending-acked messages
+        // for redelivery and inflate what the verifier sees below. The rate (-r) only paces the run.
+        String argString = "%s -r 1000 -u %s -txn -ss %s -st %s -sp %s -ntxn %d -tto 60";
+        String subName = "sub";
+        String topic = testTopic + UUID.randomUUID();
+        // -st is PerformanceConsumer's own SubscriptionType enum (Exclusive); -sp is the v5
+        // SubscriptionInitialPosition enum (EARLIEST).
+        String args = String.format(argString, topic, pulsar.getBrokerServiceUrl(), subName,
+                "Exclusive", "EARLIEST", 10);
+
+        admin.scalableTopics().createScalableTopic(topic, 1);
+
+        @Cleanup
+        Producer<byte[]> producer = v5Client.newProducer(Schema.bytes()).topic(topic).create();
+        @Cleanup
+        QueueConsumer<byte[]> subscribe = v5Client.newQueueConsumer(Schema.bytes())
+                .topic(topic)
+                .subscriptionName(subName + "pre")
+                .subscriptionInitialPosition(SubscriptionInitialPosition.EARLIEST)
+                .subscribe();
+        // Exactly numMessagesPerTransaction (50) * -ntxn (10) messages, so the perf consumer commits
+        // all of them across 10 transactions and leaves the subscription empty.
+        for (int i = 0; i < 500; i++) {
+            producer.newMessage().value("messages for test transaction consumer".getBytes()).send();
+        }
+        Thread thread = new Thread(() -> {
+            try {
+                new PerformanceConsumer().run(args.split(" "));
+            } catch (Exception e) {
+                e.printStackTrace();
+            }
+        }, "Performance_Consumer_Task");
+        thread.start();
+        thread.join();
+
+        // The perf consumer committed all 10 txns * 50 msgs = 500 transactional acks, so every message
+        // is permanently acknowledged and a fresh consumer on the same subscription sees nothing.
+        @Cleanup
+        QueueConsumer<byte[]> consumer = v5Client.newQueueConsumer(Schema.bytes())
+                .subscriptionName(subName)
+                .topic(topic)
+                .subscriptionInitialPosition(SubscriptionInitialPosition.EARLIEST)
+                .subscribe();
+        Message<byte[]> message = consumer.receive(Duration.ofSeconds(2));
+        Assert.assertNull(message, "all transactionally-acked messages must stay acknowledged");
+    }
+
+    /** Keeps every transaction the producer opens, to check what became of each one. */
+    private static final class TransactionRecordingProducer extends PerformanceProducerV5 {
+        private final List<Transaction> transactions = new CopyOnWriteArrayList<>();
+
+        TransactionRecordingProducer(PerformanceProducer arguments) {
+            super(arguments);
+        }
+
+        @Override
+        protected Transaction openFirstTransaction(PulsarClient client)
+                throws PulsarClientException, InterruptedException {
+            Transaction transaction = super.openFirstTransaction(client);
+            transactions.add(transaction);
+            return transaction;
+        }
+
+        @Override
+        protected Transaction newTransaction(PulsarClient client) throws PulsarClientException {
+            Transaction transaction = super.newTransaction(client);
+            transactions.add(transaction);
+            return transaction;
+        }
+    }
+}

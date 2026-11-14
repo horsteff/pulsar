@@ -1,4 +1,4 @@
-/**
+/*
  * Licensed to the Apache Software Foundation (ASF) under one
  * or more contributor license agreements.  See the NOTICE file
  * distributed with this work for additional information
@@ -18,17 +18,20 @@
  */
 package org.apache.pulsar.broker.transaction.coordinator;
 
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import java.net.InetSocketAddress;
+import java.util.Objects;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
-import com.google.common.collect.Sets;
 import org.apache.pulsar.broker.PulsarService;
 import org.apache.pulsar.broker.transaction.TransactionTestBase;
 import org.apache.pulsar.client.api.PulsarClient;
 import org.apache.pulsar.client.api.ServiceUrlProvider;
-import org.apache.pulsar.common.naming.NamespaceName;
-import org.apache.pulsar.common.naming.TopicName;
-import org.apache.pulsar.common.policies.data.ClusterData;
-import org.apache.pulsar.common.policies.data.TenantInfoImpl;
+import org.apache.pulsar.client.api.transaction.TransactionCoordinatorClientException.CoordinatorNotFoundException;
+import org.apache.pulsar.client.impl.PulsarClientImpl;
+import org.apache.pulsar.common.naming.SystemTopicNames;
+import org.apache.pulsar.common.protocol.Commands;
 import org.apache.pulsar.transaction.coordinator.TransactionCoordinatorID;
 import org.awaitility.Awaitility;
 import org.testng.Assert;
@@ -41,15 +44,7 @@ public class TransactionMetaStoreAssignmentTest extends TransactionTestBase {
     @Override
     @BeforeMethod(alwaysRun = true)
     protected void setup() throws Exception {
-        setBrokerCount(3);
-        super.internalSetup();
-        String[] brokerServiceUrlArr = getPulsarServiceList().get(0).getBrokerServiceUrl().split(":");
-        String webServicePort = brokerServiceUrlArr[brokerServiceUrlArr.length -1];
-        admin.clusters().createCluster(CLUSTER_NAME, ClusterData.builder().serviceUrl("http://localhost:" + webServicePort).build());
-        admin.tenants().createTenant(NamespaceName.SYSTEM_NAMESPACE.getTenant(),
-                new TenantInfoImpl(Sets.newHashSet("appid1"), Sets.newHashSet(CLUSTER_NAME)));
-        admin.namespaces().createNamespace(NamespaceName.SYSTEM_NAMESPACE.toString());
-        admin.topics().createPartitionedTopic(TopicName.TRANSACTION_COORDINATOR_ASSIGN.toString(), 16);
+        setUpBase(3, 16, null, 0);
         pulsarClient.close();
     }
 
@@ -73,12 +68,13 @@ public class TransactionMetaStoreAssignmentTest extends TransactionTestBase {
         pulsarServiceList.remove(crashedMetaStore);
         crashedMetaStore.close();
 
+        pulsarClient.close();
         pulsarClient = buildClient();
         Awaitility.await().atMost(5, TimeUnit.SECONDS)
                 .untilAsserted(() -> {
                     int transactionMetaStoreCount2 = pulsarServiceList.stream()
-                            .mapToInt(pulsarService -> pulsarService.getTransactionMetadataStoreService().getStores().size())
-                            .sum();
+                            .mapToInt(pulsarService -> pulsarService.getTransactionMetadataStoreService()
+                                    .getStores().size()).sum();
                     Assert.assertEquals(transactionMetaStoreCount2, 16);
                 });
         pulsarClient.close();
@@ -93,7 +89,7 @@ public class TransactionMetaStoreAssignmentTest extends TransactionTestBase {
         // close pulsar client will not init tc again
         pulsarClient.close();
 
-        admin.topics().unload(TopicName.TRANSACTION_COORDINATOR_ASSIGN.toString());
+        admin.topics().unload(SystemTopicNames.TRANSACTION_COORDINATOR_ASSIGN.toString());
 
         for (int i = 0; i < 16; i++) {
             final int f = i;
@@ -102,23 +98,72 @@ public class TransactionMetaStoreAssignmentTest extends TransactionTestBase {
                     .removeTransactionMetadataStore(TransactionCoordinatorID.get(f)));
         }
         checkTransactionCoordinatorNum(0);
-        buildClient();
+        pulsarClient = buildClient();
         checkTransactionCoordinatorNum(16);
 
         pulsarClient.close();
 
     }
 
+    @Test
+    public void testScalableHandshakeRequiresElectedLeader() throws Exception {
+        PulsarService leader = awaitTcZeroLeader();
+        PulsarService bundleOwner = pulsarServiceList.stream().filter(broker -> broker != leader).findFirst()
+                .orElseThrow();
+        var assignTopic = SystemTopicNames.TRANSACTION_COORDINATOR_ASSIGN.getPartition(0);
+        if (!admin.lookups().lookupTopic(assignTopic.toString()).equals(bundleOwner.getBrokerServiceUrl())) {
+            String bundle = admin.lookups().getBundleRange(assignTopic.toString());
+            admin.namespaces().unloadNamespaceBundle(assignTopic.getNamespace(), bundle, bundleOwner.getBrokerId());
+        }
+        Awaitility.await().untilAsserted(() -> {
+            assertThat(admin.lookups().lookupTopic(assignTopic.toString()))
+                    .isEqualTo(bundleOwner.getBrokerServiceUrl());
+            assertThat(bundleOwner.getNamespaceService().isServiceUnitOwned(assignTopic)).isTrue();
+        });
+        assertThat(bundleOwner.getTransactionCoordinatorV5().isLeaderFor(0)).isFalse();
+
+        PulsarClientImpl client = (PulsarClientImpl) leader.getClient();
+        connectToTcZero(client, leader, true);
+        connectToTcZero(client, bundleOwner, false);
+        assertThatThrownBy(() -> connectToTcZero(client, bundleOwner, true))
+                .as("v5 handshake on the assign-topic bundle owner")
+                .hasCauseInstanceOf(CoordinatorNotFoundException.class);
+
+        leader.getTransactionCoordinatorV5().close();
+        assertThatThrownBy(() -> connectToTcZero(client, leader, true))
+                .hasCauseInstanceOf(CoordinatorNotFoundException.class);
+        PulsarService nextLeader = awaitTcZeroLeader();
+        assertThat(nextLeader).isNotSameAs(leader);
+        connectToTcZero(client, nextLeader, true);
+    }
+
+    private PulsarService awaitTcZeroLeader() {
+        return Awaitility.await().until(() -> pulsarServiceList.stream()
+                .filter(broker -> broker.getTransactionCoordinatorV5().isLeaderFor(0))
+                .findFirst().orElse(null), Objects::nonNull);
+    }
+
+    private static void connectToTcZero(PulsarClientImpl client, PulsarService broker, boolean scalable)
+            throws Exception {
+        var address = InetSocketAddress.createUnresolved(broker.getAdvertisedAddress(),
+                broker.getBrokerListenPort().orElseThrow());
+        var cnx = client.getCnxPool().getConnection(address).get(10, TimeUnit.SECONDS);
+        long requestId = client.newRequestId();
+        cnx.sendScalableSessionRequest(Commands.newTcClientConnectRequest(0, requestId, scalable), requestId)
+                .get(10, TimeUnit.SECONDS);
+    }
+
     private void checkTransactionCoordinatorNum(int number) {
         Awaitility.await()
                 .untilAsserted(() -> {
                     int transactionMetaStoreCount = pulsarServiceList.stream()
-                            .mapToInt(pulsarService -> pulsarService.getTransactionMetadataStoreService().getStores().size())
-                            .sum();
+                            .mapToInt(pulsarService -> pulsarService.getTransactionMetadataStoreService()
+                                    .getStores().size()).sum();
                     Assert.assertEquals(transactionMetaStoreCount, number);
                 });
     }
 
+    @SuppressWarnings({"try", "deprecation"})
     private PulsarClient buildClient() throws Exception {
         return PulsarClient.builder()
                 .serviceUrlProvider(new ServiceUrlProvider() {
@@ -130,7 +175,8 @@ public class TransactionMetaStoreAssignmentTest extends TransactionTestBase {
 
                     @Override
                     public String getServiceUrl() {
-                        return pulsarServiceList.get(atomicInteger.getAndIncrement() % pulsarServiceList.size()).getBrokerServiceUrl();
+                        return pulsarServiceList.get(atomicInteger.getAndIncrement()
+                                % pulsarServiceList.size()).getBrokerServiceUrl();
                     }
                 })
                 .statsInterval(0, TimeUnit.SECONDS)

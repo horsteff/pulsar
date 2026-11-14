@@ -1,4 +1,4 @@
-/**
+/*
  * Licensed to the Apache Software Foundation (ASF) under one
  * or more contributor license agreements.  See the NOTICE file
  * distributed with this work for additional information
@@ -19,20 +19,16 @@
 package org.apache.pulsar.client.tutorial;
 
 import java.io.IOException;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
-
+import lombok.CustomLog;
 import org.apache.pulsar.client.api.MessageId;
 import org.apache.pulsar.client.api.Producer;
 import org.apache.pulsar.client.api.PulsarClient;
-import org.apache.pulsar.client.api.PulsarClientException;
 
-import com.google.common.collect.Lists;
-
-import lombok.extern.slf4j.Slf4j;
-
-@Slf4j
+@CustomLog
 public class SampleAsyncProducer {
     public static void main(String[] args) throws InterruptedException, IOException {
         PulsarClient pulsarClient = PulsarClient.builder().serviceUrl("http://localhost:8080").build();
@@ -40,7 +36,7 @@ public class SampleAsyncProducer {
         Producer<byte[]> producer = pulsarClient.newProducer().topic("persistent://my-tenant/my-ns/my-topic")
                 .sendTimeout(3, TimeUnit.SECONDS).create();
 
-        List<CompletableFuture<MessageId>> futures = Lists.newArrayList();
+        List<CompletableFuture<MessageId>> futures = new ArrayList<>();
 
         for (int i = 0; i < 10; i++) {
             final String content = "my-message-" + i;
@@ -48,9 +44,9 @@ public class SampleAsyncProducer {
 
             future.handle((v, ex) -> {
                 if (ex == null) {
-                    log.info("Message persisted: {}", content);
+                    log.info().attr("content", content).log("Message persisted");
                 } else {
-                    log.error("Error persisting message: {}", content, ex);
+                    log.error().attr("content", content).exception(ex).log("Error persisting message");
                 }
                 return null;
             });

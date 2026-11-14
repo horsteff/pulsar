@@ -1,4 +1,4 @@
-/**
+/*
  * Licensed to the Apache Software Foundation (ASF) under one
  * or more contributor license agreements.  See the NOTICE file
  * distributed with this work for additional information
@@ -22,20 +22,25 @@ import static org.testng.Assert.assertEquals;
 import static org.testng.Assert.assertFalse;
 import static org.testng.Assert.assertNull;
 import static org.testng.Assert.assertTrue;
-
-import com.google.common.base.Charsets;
-
-import java.io.*;
-import java.util.Collections;
+import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
+import java.io.File;
+import java.io.ObjectInput;
+import java.io.ObjectInputStream;
+import java.io.ObjectOutputStream;
+import java.io.Serializable;
+import java.nio.charset.StandardCharsets;
+import java.util.Map;
 import java.util.function.Supplier;
-
+import lombok.Cleanup;
 import org.apache.commons.io.FileUtils;
-import org.apache.commons.lang.SerializationUtils;
 import org.apache.pulsar.client.api.Authentication;
 import org.apache.pulsar.client.api.AuthenticationDataProvider;
+import org.apache.pulsar.client.api.AuthenticationFactory;
 import org.apache.pulsar.client.impl.PulsarClientImpl;
 import org.apache.pulsar.client.impl.conf.ClientConfigurationData;
 import org.testng.annotations.Test;
+import org.testng.collections.Maps;
 
 public class AuthenticationTokenTest {
 
@@ -53,19 +58,23 @@ public class AuthenticationTokenTest {
         assertNull(authData.getTlsPrivateKey());
 
         assertTrue(authData.hasDataForHttp());
-        assertEquals(authData.getHttpHeaders(),
-                Collections.singletonMap("Authorization", "Bearer token-xyz").entrySet());
+        Map<String, String> headers = Maps.newHashMap();
+        headers.put("Authorization", "Bearer token-xyz");
+        headers.put("X-Pulsar-Auth-Method-Name", "token");
+        assertEquals(authData.getHttpHeaders(), headers.entrySet());
 
         authToken.close();
     }
 
+    @SuppressWarnings("deprecation")
     @Test
     public void testAuthTokenClientConfig() throws Exception {
         ClientConfigurationData clientConfig = new ClientConfigurationData();
         clientConfig.setServiceUrl("pulsar://service-url");
-        clientConfig.setAuthPluginClassName(AuthenticationToken.class.getName());
-        clientConfig.setAuthParams("token-xyz");
+        clientConfig.setAuthentication(AuthenticationFactory.create(
+                AuthenticationToken.class.getName(), "token-xyz"));
 
+        @Cleanup
         PulsarClientImpl pulsarClient = new PulsarClientImpl(clientConfig);
 
         Authentication authToken = pulsarClient.getConfiguration().getAuthentication();
@@ -80,8 +89,10 @@ public class AuthenticationTokenTest {
         assertNull(authData.getTlsPrivateKey());
 
         assertTrue(authData.hasDataForHttp());
-        assertEquals(authData.getHttpHeaders(),
-                Collections.singletonMap("Authorization", "Bearer token-xyz").entrySet());
+        Map<String, String> headers = Maps.newHashMap();
+        headers.put("Authorization", "Bearer token-xyz");
+        headers.put("X-Pulsar-Auth-Method-Name", "token");
+        assertEquals(authData.getHttpHeaders(), headers.entrySet());
 
         authToken.close();
     }
@@ -100,12 +111,12 @@ public class AuthenticationTokenTest {
 
     @Test
     public void testAuthTokenConfigFromFile() throws Exception {
-        File tokenFile = File.createTempFile("pular-test-token", ".key");
+        File tokenFile = File.createTempFile("pulsar-test-token", ".key");
         tokenFile.deleteOnExit();
-        FileUtils.write(tokenFile, "my-test-token-string", Charsets.UTF_8);
+        FileUtils.write(tokenFile, "my-test-token-string", StandardCharsets.UTF_8);
 
         AuthenticationToken authToken = new AuthenticationToken();
-        authToken.configure("file://" + tokenFile);
+        authToken.configure(getTokenFileUri(tokenFile));
         assertEquals(authToken.getAuthMethodName(), "token");
 
         AuthenticationDataProvider authData = authToken.getAuthData();
@@ -113,7 +124,7 @@ public class AuthenticationTokenTest {
         assertEquals(authData.getCommandData(), "my-test-token-string");
 
         // Ensure if the file content changes, the token will get refreshed as well
-        FileUtils.write(tokenFile, "other-token", Charsets.UTF_8);
+        FileUtils.write(tokenFile, "other-token", StandardCharsets.UTF_8);
 
         AuthenticationDataProvider authData2 = authToken.getAuthData();
         assertTrue(authData2.hasDataFromCommand());
@@ -128,12 +139,12 @@ public class AuthenticationTokenTest {
      */
     @Test
     public void testAuthTokenConfigFromFileWithNewline() throws Exception {
-        File tokenFile = File.createTempFile("pular-test-token", ".key");
+        File tokenFile = File.createTempFile("pulsar-test-token", ".key");
         tokenFile.deleteOnExit();
-        FileUtils.write(tokenFile, "  my-test-token-string  \r\n", Charsets.UTF_8);
+        FileUtils.write(tokenFile, "  my-test-token-string  \r\n", StandardCharsets.UTF_8);
 
         AuthenticationToken authToken = new AuthenticationToken();
-        authToken.configure("file://" + tokenFile);
+        authToken.configure(getTokenFileUri(tokenFile));
         assertEquals(authToken.getAuthMethodName(), "token");
 
         AuthenticationDataProvider authData = authToken.getAuthData();
@@ -141,7 +152,7 @@ public class AuthenticationTokenTest {
         assertEquals(authData.getCommandData(), "my-test-token-string");
 
         // Ensure if the file content changes, the token will get refreshed as well
-        FileUtils.write(tokenFile, "other-token", Charsets.UTF_8);
+        FileUtils.write(tokenFile, "other-token", StandardCharsets.UTF_8);
 
         AuthenticationDataProvider authData2 = authToken.getAuthData();
         assertTrue(authData2.hasDataFromCommand());
@@ -197,10 +208,14 @@ public class AuthenticationTokenTest {
         assertEquals(tokenSupplier.token, ts.getAuthData().getCommandData());
     }
 
+    private String getTokenFileUri(File file) {
+        return file.toURI().toString();
+    }
+
     public static class SerializableSupplier implements Supplier<String>, Serializable {
 
         private static final long serialVersionUID = 6259616338933150683L;
-        private String token;
+        private final String token;
 
         public SerializableSupplier(final String token) {
             super();

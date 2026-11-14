@@ -1,4 +1,4 @@
-/**
+/*
  * Licensed to the Apache Software Foundation (ASF) under one
  * or more contributor license agreements.  See the NOTICE file
  * distributed with this work for additional information
@@ -46,19 +46,24 @@ public class BookKeeperPackagesStorageTest extends BookKeeperClusterTestCase {
     }
 
     @BeforeMethod()
-    public void setup() throws Exception {
+    public void start() throws Exception {
+        storage = newStorage();
+    }
+
+    private PackagesStorage newStorage() throws Exception {
         PackagesStorageProvider provider = PackagesStorageProvider
             .newProvider(BookKeeperPackagesStorageProvider.class.getName());
         DefaultPackagesStorageConfiguration configuration = new DefaultPackagesStorageConfiguration();
-        configuration.setProperty("zookeeperServers", zkUtil.getZooKeeperConnectString());
+        configuration.setProperty("metadataStoreUrl", zkUtil.getZooKeeperConnectString());
         configuration.setProperty("packagesReplicas", "1");
         configuration.setProperty("packagesManagementLedgerRootPath", "/ledgers");
-        storage = provider.getStorage(configuration);
-        storage.initialize();
+        PackagesStorage packagesStorage = provider.getStorage(configuration);
+        packagesStorage.initialize();
+        return packagesStorage;
     }
 
     @AfterMethod(alwaysRun = true)
-    public void teardown() throws Exception {
+    public void close() throws Exception {
         if (storage != null) {
             storage.closeAsync().get();
         }
@@ -68,7 +73,7 @@ public class BookKeeperPackagesStorageTest extends BookKeeperClusterTestCase {
     public void testConfiguration() {
         assertTrue(storage instanceof BookKeeperPackagesStorage);
         BookKeeperPackagesStorage bkStorage = (BookKeeperPackagesStorage) storage;
-        assertEquals(bkStorage.configuration.getZookeeperServers(), zkUtil.getZooKeeperConnectString());
+        assertEquals(bkStorage.configuration.getMetadataStoreUrl(), zkUtil.getZooKeeperConnectString());
         assertEquals(bkStorage.configuration.getPackagesReplicas(), 1);
         assertEquals(bkStorage.configuration.getPackagesManagementLedgerRootPath(), "/ledgers");
     }
@@ -90,6 +95,7 @@ public class BookKeeperPackagesStorageTest extends BookKeeperClusterTestCase {
         assertEquals(testData, readResult);
     }
 
+    @SuppressWarnings("deprecation")
     @Test(timeOut = 60000)
     public void testReadWriteLargeDataOperations() throws ExecutionException, InterruptedException {
         byte[] data = RandomUtils.nextBytes(8192 * 3 + 4096);
@@ -168,7 +174,7 @@ public class BookKeeperPackagesStorageTest extends BookKeeperClusterTestCase {
         storage.deleteAsync(testPath).get();
 
         // list again and not file under the path
-        paths= storage.listAsync("").get();
+        paths = storage.listAsync("").get();
         assertEquals(paths.size(), 0);
 
 
@@ -182,6 +188,34 @@ public class BookKeeperPackagesStorageTest extends BookKeeperClusterTestCase {
     }
 
     @Test(timeOut = 60000)
+    public void testReadAfterAnotherStorageRewritesThePath() throws Exception {
+        // a second storage on the same cluster, as on another broker
+        PackagesStorage otherStorage = newStorage();
+        try {
+            String testPath = "test-rewrite-path";
+
+            // write the data with this storage, then delete and rewrite it with the other one,
+            // as PackagesManagementImpl.updateMeta does with the package metadata
+            storage.writeAsync(testPath, new ByteArrayInputStream("old-data".getBytes(StandardCharsets.UTF_8))).get();
+            otherStorage.deleteAsync(testPath).get();
+            otherStorage.writeAsync(testPath, new ByteArrayInputStream("new-data".getBytes(StandardCharsets.UTF_8)))
+                    .get();
+
+            // both storages read the new data right away
+            assertEquals(readString(storage, testPath), "new-data");
+            assertEquals(readString(otherStorage, testPath), "new-data");
+        } finally {
+            otherStorage.closeAsync().get();
+        }
+    }
+
+    private static String readString(PackagesStorage storage, String path) throws Exception {
+        ByteArrayOutputStream readData = new ByteArrayOutputStream();
+        storage.readAsync(path, readData).get();
+        return readData.toString(StandardCharsets.UTF_8);
+    }
+
+    @Test(timeOut = 60000)
     public void testExistOperation() throws ExecutionException, InterruptedException {
         Boolean exist = storage.existAsync("test-path").get();
         org.testng.Assert.assertFalse(exist);
@@ -190,6 +224,60 @@ public class BookKeeperPackagesStorageTest extends BookKeeperClusterTestCase {
 
         exist = storage.existAsync("test-path").get();
         assertTrue(exist);
+    }
+
+    @Test(timeOut = 60000)
+    public void testReadWriteOperationsWithSeparatedBkCluster() throws Exception {
+        PackagesStorageProvider provider = PackagesStorageProvider
+                .newProvider(BookKeeperPackagesStorageProvider.class.getName());
+        DefaultPackagesStorageConfiguration configuration = new DefaultPackagesStorageConfiguration();
+        // set the unavailable bk cluster with mock zookeeper path
+        configuration.setProperty("metadataStoreUrl", zkUtil.getZooKeeperConnectString() + "/mock");
+        configuration.setProperty("packagesReplicas", "1");
+        configuration.setProperty("packagesManagementLedgerRootPath", "/ledgers");
+        PackagesStorage storage1 = provider.getStorage(configuration);
+        storage1.initialize();
+
+        String mockData = "mock-data";
+        ByteArrayInputStream mockDataStream = new ByteArrayInputStream(mockData.getBytes(StandardCharsets.UTF_8));
+        String mockPath = "mock-path";
+
+        // write some data to the dlog will fail
+        try {
+            storage1.writeAsync(mockPath, mockDataStream).get();
+        } catch (Exception e) {
+            String errMsg = e.getCause().getMessage();
+            assertTrue(errMsg.contains("Error on allocating ledger") || errMsg.contains("Write rejected"));
+        } finally {
+            storage1.closeAsync().get();
+        }
+
+        // set the available bk cluster with bookkeeperMetadataServiceUri using actual zookeeper path
+        String bookkeeperMetadataServiceUri = String.format("zk+null://%s/ledgers", zkUtil.getZooKeeperConnectString());
+        DefaultPackagesStorageConfiguration configuration2 = new DefaultPackagesStorageConfiguration();
+        configuration2.setProperty("metadataStoreUrl", zkUtil.getZooKeeperConnectString());
+        configuration2.setProperty("bookkeeperMetadataServiceUri", bookkeeperMetadataServiceUri);
+        configuration2.setProperty("packagesReplicas", "1");
+        PackagesStorage storage2 = provider.getStorage(configuration2);
+        storage2.initialize();
+
+        String testData = "test-data";
+        ByteArrayInputStream testDataStream = new ByteArrayInputStream(testData.getBytes(StandardCharsets.UTF_8));
+        String testPath = "test-path";
+
+        // write some data to the dlog will success
+        try {
+            storage2.writeAsync(testPath, testDataStream).get();
+
+            // read the data from the dlog
+            ByteArrayOutputStream readData = new ByteArrayOutputStream();
+            storage2.readAsync(testPath, readData).get();
+            String readResult = new String(readData.toByteArray(), StandardCharsets.UTF_8);
+
+            assertEquals(testData, readResult);
+        } finally {
+            storage2.closeAsync().get();
+        }
     }
 
 }

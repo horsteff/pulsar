@@ -1,4 +1,4 @@
-/**
+/*
  * Licensed to the Apache Software Foundation (ASF) under one
  * or more contributor license agreements.  See the NOTICE file
  * distributed with this work for additional information
@@ -32,7 +32,10 @@ public abstract class TopicTransactionBufferState {
         None,
         Initializing,
         Ready,
-        Close
+        Close,
+        ClosedAndCleared,
+        NoSnapshot,
+        FirstSnapshotting
     }
 
     private static final AtomicReferenceFieldUpdater<TopicTransactionBufferState, State> STATE_UPDATER =
@@ -49,18 +52,52 @@ public abstract class TopicTransactionBufferState {
         return (STATE_UPDATER.compareAndSet(this, State.Initializing, State.Ready));
     }
 
+    protected boolean changeToNoSnapshotState() {
+        return (STATE_UPDATER.compareAndSet(this, State.Initializing, State.NoSnapshot));
+    }
+
     protected boolean changeToInitializingState() {
         return STATE_UPDATER.compareAndSet(this, State.None, State.Initializing);
     }
 
-    protected boolean changeToCloseState() {
-        return (STATE_UPDATER.compareAndSet(this, State.Ready, State.Close)
-                || STATE_UPDATER.compareAndSet(this, State.None, State.Close)
-                || STATE_UPDATER.compareAndSet(this, State.Initializing, State.Close));
+    protected boolean changeToReadyStateFromNoSnapshot() {
+        return STATE_UPDATER.compareAndSet(this, State.FirstSnapshotting, State.Ready);
+    }
+
+    protected boolean changeToFirstSnapshotting() {
+        return STATE_UPDATER.compareAndSet(this, State.NoSnapshot, State.FirstSnapshotting);
+    }
+
+    protected void changeToCloseState() {
+        STATE_UPDATER.set(this, State.Close);
+    }
+
+    protected void changeToClosedAndClearedState() {
+        STATE_UPDATER.compareAndSet(this, State.Close, State.ClosedAndCleared);
+    }
+
+    public boolean checkIfInitializing() {
+        return STATE_UPDATER.get(this) == State.Initializing;
+    }
+
+    public boolean checkIfFirstSnapshotting() {
+        return STATE_UPDATER.get(this) == State.FirstSnapshotting;
     }
 
     public boolean checkIfReady() {
         return STATE_UPDATER.get(this) == State.Ready;
+    }
+
+    public boolean checkIfNoSnapshot() {
+        return STATE_UPDATER.get(this) == State.NoSnapshot;
+    }
+
+    public boolean checkIfClosed() {
+        return STATE_UPDATER.get(this) == State.Close || STATE_UPDATER.get(this) == State.ClosedAndCleared;
+    }
+
+    public boolean checkIfClosedAndCleared() {
+        return STATE_UPDATER.get(this) == State.ClosedAndCleared;
     }
 
     public State getState() {

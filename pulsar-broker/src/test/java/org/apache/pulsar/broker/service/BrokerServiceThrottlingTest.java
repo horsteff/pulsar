@@ -1,4 +1,4 @@
-/**
+/*
  * Licensed to the Apache Software Foundation (ASF) under one
  * or more contributor license agreements.  See the NOTICE file
  * distributed with this work for additional information
@@ -18,13 +18,11 @@
  */
 package org.apache.pulsar.broker.service;
 
+import static io.opentelemetry.sdk.testing.assertj.OpenTelemetryAssertions.assertThat;
+import static org.awaitility.Awaitility.waitAtMost;
 import static org.testng.Assert.assertEquals;
-import static org.testng.Assert.assertNotEquals;
 import static org.testng.Assert.assertTrue;
 import static org.testng.Assert.fail;
-
-import com.google.common.collect.Lists;
-import com.google.common.collect.Maps;
 import io.netty.buffer.ByteBuf;
 import io.netty.channel.EventLoopGroup;
 import io.netty.util.concurrent.DefaultThreadFactory;
@@ -41,7 +39,7 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import lombok.Cleanup;
-import org.apache.bookkeeper.util.ZkUtils;
+import org.apache.pulsar.broker.testcontext.PulsarTestContext;
 import org.apache.pulsar.client.api.Consumer;
 import org.apache.pulsar.client.api.PulsarClient;
 import org.apache.pulsar.client.api.PulsarClientException;
@@ -49,11 +47,9 @@ import org.apache.pulsar.client.api.SubscriptionType;
 import org.apache.pulsar.client.impl.ConnectionPool;
 import org.apache.pulsar.client.impl.PulsarServiceNameResolver;
 import org.apache.pulsar.client.impl.conf.ClientConfigurationData;
+import org.apache.pulsar.client.impl.metrics.InstrumentProvider;
 import org.apache.pulsar.common.protocol.Commands;
-import org.apache.pulsar.common.util.ObjectMapperFactory;
 import org.apache.pulsar.common.util.netty.EventLoopUtil;
-import org.apache.zookeeper.CreateMode;
-import org.apache.zookeeper.ZooDefs;
 import org.testng.annotations.AfterMethod;
 import org.testng.annotations.BeforeMethod;
 import org.testng.annotations.Test;
@@ -73,18 +69,46 @@ public class BrokerServiceThrottlingTest extends BrokerTestBase {
         super.internalCleanup();
     }
 
+    @Override
+    protected void customizeMainPulsarTestContextBuilder(PulsarTestContext.Builder builder) {
+        super.customizeMainPulsarTestContextBuilder(builder);
+        builder.enableOpenTelemetry(true);
+    }
+
     /**
-     * Verifies: updating zk-throttling node reflects broker-maxConcurrentLookupRequest and updates semaphore.
-     *
-     * @throws Exception
+     * Verifies: updating zk-throttling node reflects broker-maxConcurrentLookupRequest and updates semaphore, as well
+     * as the related limit metric value.
      */
     @Test
     public void testThrottlingLookupRequestSemaphore() throws Exception {
-        BrokerService service = pulsar.getBrokerService();
-        assertNotEquals(service.lookupRequestSemaphore.get().availablePermits(), 0);
-        admin.brokers().updateDynamicConfiguration("maxConcurrentLookupRequest", Integer.toString(0));
-        Thread.sleep(1000);
-        assertEquals(service.lookupRequestSemaphore.get().availablePermits(), 0);
+        var lookupRequestSemaphore = pulsar.getBrokerService().lookupRequestSemaphore;
+        var configName = "maxConcurrentLookupRequest";
+        var metricName = BrokerService.TOPIC_LOOKUP_LIMIT_METRIC_NAME;
+        // Validate that the configuration has not been overridden.
+        assertThat(admin.brokers().getAllDynamicConfigurations()).doesNotContainKey(configName);
+        assertOtelMetricLongSumValue(metricName, 50_000);
+        assertThat(lookupRequestSemaphore.get().availablePermits()).isNotEqualTo(0);
+        admin.brokers().updateDynamicConfiguration(configName, Integer.toString(0));
+        waitAtMost(1, TimeUnit.SECONDS).until(() -> lookupRequestSemaphore.get().availablePermits() == 0);
+        assertOtelMetricLongSumValue(metricName, 0);
+    }
+
+    /**
+     * Verifies: updating zk-throttling node reflects broker-maxConcurrentTopicLoadRequest and updates semaphore, as
+     * well as the related limit metric value.
+     */
+    @Test
+    public void testThrottlingTopicLoadRequestSemaphore() throws Exception {
+        var topicLoadRequestSemaphore = pulsar.getBrokerService().topicLoadRequestSemaphore;
+        var configName = "maxConcurrentTopicLoadRequest";
+        var metricName = BrokerService.TOPIC_LOAD_LIMIT_METRIC_NAME;
+        // Validate that the configuration has not been overridden.
+        assertThat(admin.brokers().getAllDynamicConfigurations()).doesNotContainKey(configName);
+        assertOtelMetricLongSumValue(metricName, 5_000);
+        assertThat(topicLoadRequestSemaphore.get().availablePermits()).isNotEqualTo(0);
+        admin.brokers().updateDynamicConfiguration(configName, Integer.toString(0));
+        waitAtMost(1, TimeUnit.SECONDS).until(() -> topicLoadRequestSemaphore.get().availablePermits() == 0);
+        assertOtelMetricLongSumValue(metricName, 0);
     }
 
     /**
@@ -93,6 +117,7 @@ public class BrokerServiceThrottlingTest extends BrokerTestBase {
      *
      * @throws Exception
      */
+    @SuppressWarnings("deprecation")
     @Test
     public void testLookupThrottlingForClientByBroker0Permit() throws Exception {
 
@@ -102,6 +127,8 @@ public class BrokerServiceThrottlingTest extends BrokerTestBase {
         PulsarClient pulsarClient = PulsarClient.builder()
                 .serviceUrl(pulsar.getBrokerServiceUrl())
                 .statsInterval(0, TimeUnit.SECONDS)
+                // A throttled lookup is retried until the lookup timeout, then fails with the broker's error
+                .lookupTimeout(1, TimeUnit.SECONDS)
                 .build();
 
         Consumer<byte[]> consumer = pulsarClient.newConsumer().topic(topicName).subscriptionName("mysub").subscribe();
@@ -128,7 +155,7 @@ public class BrokerServiceThrottlingTest extends BrokerTestBase {
     }
 
     /**
-     * Verifies: Broker side throttling:
+     * Verifies: Broker side throttling.
      *
      * <pre>
      * 1. concurrent_consumer_creation > maxConcurrentLookupRequest at broker
@@ -137,6 +164,7 @@ public class BrokerServiceThrottlingTest extends BrokerTestBase {
      *
      * @throws Exception
      */
+    @SuppressWarnings("deprecation")
     @Test
     public void testLookupThrottlingForClientByBroker() throws Exception {
         final String topicName = "persistent://prop/ns-abc/newTopic";
@@ -166,7 +194,7 @@ public class BrokerServiceThrottlingTest extends BrokerTestBase {
         EventLoopGroup eventLoop = EventLoopUtil.newEventLoopGroup(20, false,
                 new DefaultThreadFactory("test-pool", Thread.currentThread().isDaemon()));
         ExecutorService executor = Executors.newFixedThreadPool(10);
-        try (ConnectionPool pool = new ConnectionPool(conf, eventLoop)) {
+        try (ConnectionPool pool = new ConnectionPool(InstrumentProvider.NOOP, conf, eventLoop, null)) {
             final int totalConsumers = 20;
             List<Future<?>> futures = new ArrayList<>();
 
@@ -174,7 +202,7 @@ public class BrokerServiceThrottlingTest extends BrokerTestBase {
             for (int i = 0; i < totalConsumers; i++) {
                 long reqId = 0xdeadbeef + i;
                 Future<?> f = executor.submit(() -> {
-                        ByteBuf request = Commands.newPartitionMetadataRequest(topicName, reqId);
+                        ByteBuf request = Commands.newPartitionMetadataRequest(topicName, reqId, true);
                         pool.getConnection(resolver.resolveHost())
                             .thenCompose(clientCnx -> clientCnx.newLookup(request, reqId))
                             .get();
@@ -192,8 +220,8 @@ public class BrokerServiceThrottlingTest extends BrokerTestBase {
                     while (rootCause instanceof ExecutionException) {
                         rootCause = rootCause.getCause();
                     }
-                    if (rootCause instanceof
-                        org.apache.pulsar.client.api.PulsarClientException.TooManyRequestsException) {
+                    if (rootCause
+                            instanceof org.apache.pulsar.client.api.PulsarClientException.TooManyRequestsException) {
                         rejects++;
                     } else {
                         throw e;
@@ -225,8 +253,8 @@ public class BrokerServiceThrottlingTest extends BrokerTestBase {
                     while (rootCause instanceof ExecutionException) {
                         rootCause = rootCause.getCause();
                     }
-                    if (rootCause instanceof
-                        org.apache.pulsar.client.api.PulsarClientException.TooManyRequestsException) {
+                    if (rootCause
+                            instanceof org.apache.pulsar.client.api.PulsarClientException.TooManyRequestsException) {
                         rejects++;
                     } else {
                         throw e;
@@ -254,6 +282,7 @@ public class BrokerServiceThrottlingTest extends BrokerTestBase {
      *
      * @throws Exception
      */
+    @SuppressWarnings("deprecation")
     @Test
     public void testLookupThrottlingForClientByBrokerInternalRetry() throws Exception {
         final String topicName = "persistent://prop/ns-abc/newTopic-" + UUID.randomUUID().toString();
@@ -264,7 +293,7 @@ public class BrokerServiceThrottlingTest extends BrokerTestBase {
                 .statsInterval(0, TimeUnit.SECONDS)
                 .ioThreads(20).connectionsPerBroker(20).build();
         upsertLookupPermits(100);
-        List<Consumer<byte[]>> consumers = Collections.synchronizedList(Lists.newArrayList());
+        List<Consumer<byte[]>> consumers = Collections.synchronizedList(new ArrayList<>());
         @Cleanup("shutdownNow")
         ExecutorService executor = Executors.newFixedThreadPool(10);
         final int totalConsumers = 8;

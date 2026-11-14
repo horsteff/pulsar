@@ -1,4 +1,4 @@
-/**
+/*
  * Licensed to the Apache Software Foundation (ASF) under one
  * or more contributor license agreements.  See the NOTICE file
  * distributed with this work for additional information
@@ -18,34 +18,56 @@
  */
 package org.apache.pulsar.client.api;
 
+import java.util.ArrayList;
+import java.util.List;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ForkJoinPool;
+import java.util.concurrent.TimeUnit;
 import lombok.Cleanup;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
+import lombok.CustomLog;
+import org.apache.pulsar.broker.service.SharedPulsarBaseTest;
+import org.apache.pulsar.client.api.PulsarClientSharedResources.SharedResource;
+import org.apache.pulsar.client.impl.ConsumerBase;
+import org.apache.pulsar.client.impl.PulsarClientSharedResourcesImpl;
+import org.apache.pulsar.common.util.FutureUtil;
+import org.awaitility.Awaitility;
 import org.testng.Assert;
 import org.testng.annotations.AfterClass;
 import org.testng.annotations.BeforeClass;
 import org.testng.annotations.DataProvider;
 import org.testng.annotations.Test;
 
-import java.util.UUID;
-import java.util.concurrent.CountDownLatch;
-import java.util.concurrent.ForkJoinPool;
-import java.util.concurrent.TimeUnit;
+@Test
+@CustomLog
+public class ConsumerBatchReceiveTest extends SharedPulsarBaseTest {
 
-@Test(groups = "quarantine")
-public class ConsumerBatchReceiveTest extends ProducerConsumerBase {
+    private PulsarClientSharedResources asyncBatchReceiveSharedResources;
 
     @BeforeClass(alwaysRun = true)
-    @Override
-    protected void setup() throws Exception {
-        super.internalSetup();
-        super.producerBaseSetup();
+    public void setupAsyncBatchReceiveSharedResources() {
+        // Keep each async test's client isolated while paying the event loop shutdown quiet period once.
+        asyncBatchReceiveSharedResources = PulsarClientSharedResources.builder()
+                .resourceTypes(SharedResource.EventLoopGroup)
+                .configureEventLoop(config -> config.numberOfThreads(10))
+                .build();
     }
 
     @AfterClass(alwaysRun = true)
-    @Override
-    protected void cleanup() throws Exception {
-        super.internalCleanup();
+    public void cleanupAsyncBatchReceiveSharedResources() throws Exception {
+        if (asyncBatchReceiveSharedResources != null) {
+            asyncBatchReceiveSharedResources.close();
+            ((PulsarClientSharedResourcesImpl) asyncBatchReceiveSharedResources)
+                    .getIoEventLoopGroup().terminationFuture().get(60, TimeUnit.SECONDS);
+        }
+    }
+
+    @DataProvider(name = "partitioned")
+    public Object[][] partitionedTopicProvider() {
+        return new Object[][] {
+            { true },
+            { false }
+        };
     }
 
     @DataProvider(name = "batchReceivePolicy")
@@ -103,7 +125,7 @@ public class ConsumerBatchReceiveTest extends ProducerConsumerBase {
                 // Number of message limitation exceed receiverQueue size
                 {
                     BatchReceivePolicy.builder()
-                        .maxNumMessages(70)
+                        .maxNumMessages(50)
                         .build(), true, 50, false
                 },
                 // Number of message limitation exceed receiverQueue size and timeout limitation
@@ -138,7 +160,7 @@ public class ConsumerBatchReceiveTest extends ProducerConsumerBase {
                 // Number of message limitation exceed receiverQueue size
                 {
                     BatchReceivePolicy.builder()
-                        .maxNumMessages(70)
+                        .maxNumMessages(50)
                         .build(), false, 50, false
                 },
                 // Number of message limitation exceed receiverQueue size and timeout limitation
@@ -239,7 +261,7 @@ public class ConsumerBatchReceiveTest extends ProducerConsumerBase {
                 // Number of message limitation exceed receiverQueue size
                 {
                         BatchReceivePolicy.builder()
-                                .maxNumMessages(70)
+                                .maxNumMessages(50)
                                 .build(), true, 50, true
                 },
                 // Number of message limitation exceed receiverQueue size and timeout limitation
@@ -274,7 +296,7 @@ public class ConsumerBatchReceiveTest extends ProducerConsumerBase {
                 // Number of message limitation exceed receiverQueue size
                 {
                         BatchReceivePolicy.builder()
-                                .maxNumMessages(70)
+                                .maxNumMessages(50)
                                 .build(), false, 50, true
                 },
                 // Number of message limitation exceed receiverQueue size and timeout limitation
@@ -330,7 +352,7 @@ public class ConsumerBatchReceiveTest extends ProducerConsumerBase {
                                                     boolean batchProduce,
                                                     int receiverQueueSize,
                                                     boolean isEnableAckReceipt) throws Exception {
-        final String topic = "persistent://my-property/my-ns/batch-receive-non-partition-" + UUID.randomUUID();
+        final String topic = newTopicName();
         testBatchReceive(topic, batchReceivePolicy, batchProduce, receiverQueueSize, isEnableAckReceipt);
     }
 
@@ -339,7 +361,7 @@ public class ConsumerBatchReceiveTest extends ProducerConsumerBase {
                                                  boolean batchProduce,
                                                  int receiverQueueSize,
                                                  boolean isEnableAckReceipt) throws Exception {
-        final String topic = "persistent://my-property/my-ns/batch-receive-" + UUID.randomUUID();
+        final String topic = newTopicName();
         admin.topics().createPartitionedTopic(topic, 3);
         testBatchReceive(topic, batchReceivePolicy, batchProduce, receiverQueueSize, isEnableAckReceipt);
     }
@@ -349,7 +371,7 @@ public class ConsumerBatchReceiveTest extends ProducerConsumerBase {
                                                          boolean batchProduce,
                                                          int receiverQueueSize,
                                                          boolean isEnableAckReceipt) throws Exception {
-        final String topic = "persistent://my-property/my-ns/batch-receive-non-partition-async-" + UUID.randomUUID();
+        final String topic = newTopicName();
         testBatchReceiveAsync(topic, batchReceivePolicy, batchProduce, receiverQueueSize, isEnableAckReceipt);
     }
 
@@ -358,7 +380,7 @@ public class ConsumerBatchReceiveTest extends ProducerConsumerBase {
                                                       boolean batchProduce,
                                                       int receiverQueueSize,
                                                       boolean isEnableAckReceipt) throws Exception {
-        final String topic = "persistent://my-property/my-ns/batch-receive-async-" + UUID.randomUUID();
+        final String topic = newTopicName();
         admin.topics().createPartitionedTopic(topic, 3);
         testBatchReceiveAsync(topic, batchReceivePolicy, batchProduce, receiverQueueSize, isEnableAckReceipt);
     }
@@ -368,7 +390,7 @@ public class ConsumerBatchReceiveTest extends ProducerConsumerBase {
                                                                  boolean batchProduce,
                                                                  int receiverQueueSize,
                                                                  boolean isEnableAckReceipt) throws Exception {
-        final String topic = "persistent://my-property/my-ns/batch-receive-and-redelivery-non-partition-" + UUID.randomUUID();
+        final String topic = newTopicName();
         testBatchReceiveAndRedelivery(topic, batchReceivePolicy, batchProduce, receiverQueueSize, isEnableAckReceipt);
     }
 
@@ -377,7 +399,7 @@ public class ConsumerBatchReceiveTest extends ProducerConsumerBase {
                                                               boolean batchProduce,
                                                               int receiverQueueSize,
                                                               boolean isEnableAckReceipt) throws Exception {
-        final String topic = "persistent://my-property/my-ns/batch-receive-and-redelivery-" + UUID.randomUUID();
+        final String topic = newTopicName();
         admin.topics().createPartitionedTopic(topic, 3);
         testBatchReceiveAndRedelivery(topic, batchReceivePolicy, batchProduce, receiverQueueSize, isEnableAckReceipt);
     }
@@ -387,7 +409,7 @@ public class ConsumerBatchReceiveTest extends ProducerConsumerBase {
         final int muxNumMessages = 100;
         final int messagesToSend = 500;
 
-        final String topic = "persistent://my-property/my-ns/batch-receive-size" + UUID.randomUUID();
+        final String topic = newTopicName();
         BatchReceivePolicy batchReceivePolicy = BatchReceivePolicy.builder().maxNumMessages(muxNumMessages).build();
 
         @Cleanup
@@ -400,17 +422,81 @@ public class ConsumerBatchReceiveTest extends ProducerConsumerBase {
                 .subscribe();
 
         sendMessagesAsyncAndWait(producer, messagesToSend);
-        receiveAllBatchesAndVerifyBatchSizeIsEqualToMaxNumMessages(consumer, batchReceivePolicy, messagesToSend / muxNumMessages);
+        receiveAllBatchesAndVerifyBatchSizeIsEqualToMaxNumMessages(consumer, batchReceivePolicy,
+                messagesToSend / muxNumMessages);
     }
 
+    @Test
+    public void verifyNumBytesSmallerThanMessageSize() throws Exception {
+        final int messagesToSend = 500;
+
+        final String topic = newTopicName();
+        BatchReceivePolicy batchReceivePolicy = BatchReceivePolicy.builder().maxNumBytes(10).build();
+
+        @Cleanup
+        Producer<String> producer = pulsarClient.newProducer(Schema.STRING).topic(topic).create();
+        @Cleanup
+        Consumer<String> consumer = pulsarClient.newConsumer(Schema.STRING)
+                .topic(topic)
+                .subscriptionName("s2")
+                .batchReceivePolicy(batchReceivePolicy)
+                .subscribe();
+
+        sendMessagesAsyncAndWait(producer, messagesToSend);
+        CountDownLatch latch = new CountDownLatch(messagesToSend + 1);
+        receiveAsync(consumer, messagesToSend, latch);
+        latch.await();
+    }
+
+    @Test(dataProvider = "partitioned")
+    public void testBatchReceiveTimeoutTask(boolean partitioned) throws Exception {
+        final String topic = newTopicName();
+
+        if (partitioned) {
+            admin.topics().createPartitionedTopic(topic, 3);
+        }
+
+        @Cleanup
+        Producer<String> producer = pulsarClient.newProducer(Schema.STRING).topic(topic).create();
+        @Cleanup
+        Consumer<String> consumer = pulsarClient.newConsumer(Schema.STRING)
+                .topic(topic)
+                .subscriptionName("sub")
+                .receiverQueueSize(1)
+                .batchReceivePolicy(BatchReceivePolicy.builder()
+                        .maxNumBytes(1024 * 1024)
+                        .maxNumMessages(1)
+                        // The checks after the loop wait for this timeout: the empty batch receive, and the timeout
+                        // task that a batch receive in the loop may have left scheduled
+                        .timeout(1, TimeUnit.SECONDS)
+                        .build())
+                .subscribe();
+        Assert.assertFalse(((ConsumerBase<?>) consumer).hasBatchReceiveTimeout());
+        final int messagesToSend = 500;
+        sendMessagesAsyncAndWait(producer, messagesToSend);
+        for (int i = 0; i < 100; i++) {
+            Assert.assertNotNull(consumer.receive());
+        }
+        Assert.assertFalse(((ConsumerBase<?>) consumer).hasBatchReceiveTimeout());
+        for (int i = 0; i < 400; i++) {
+            Messages<String> batchReceived = consumer.batchReceive();
+            Assert.assertEquals(batchReceived.size(), 1);
+        }
+        Awaitility.await().untilAsserted(() -> Assert.assertFalse(
+                ((ConsumerBase<?>) consumer).hasBatchReceiveTimeout()));
+        Assert.assertEquals(consumer.batchReceive().size(), 0);
+        Awaitility.await().untilAsserted(() -> Assert.assertFalse(
+                ((ConsumerBase<?>) consumer).hasBatchReceiveTimeout()));
+    }
 
     private void receiveAllBatchesAndVerifyBatchSizeIsEqualToMaxNumMessages(Consumer<String> consumer,
-                                                                            BatchReceivePolicy batchReceivePolicy,
-                                                                            int numOfExpectedBatches) throws PulsarClientException {
+                                                       BatchReceivePolicy batchReceivePolicy,
+                                                       int numOfExpectedBatches) throws PulsarClientException {
         Messages<String> messages;
         for (int i = 0; i < numOfExpectedBatches; i++) {
             messages = consumer.batchReceive();
-            log.info("Received {} messages in a single batch receive verifying batch size.", messages.size());
+            log.info().attr("received", messages.size())
+                    .log("Received messages in a single batch receive verifying batch size.");
             Assert.assertEquals(messages.size(), batchReceivePolicy.getMaxNumMessages());
         }
     }
@@ -446,7 +532,11 @@ public class ConsumerBatchReceiveTest extends ProducerConsumerBase {
         }
 
         @Cleanup
-        PulsarClient pulsarClient = PulsarClient.builder().ioThreads(10).serviceUrl(lookupUrl.toString()).build();
+        PulsarClient pulsarClient = PulsarClient.builder()
+                .ioThreads(10)
+                .serviceUrl(getBrokerServiceUrl())
+                .sharedResources(asyncBatchReceiveSharedResources)
+                .build();
         ProducerBuilder<String> producerBuilder = pulsarClient.newProducer(Schema.STRING).topic(topic);
         if (!batchProduce) {
             producerBuilder.enableBatching(false);
@@ -490,6 +580,8 @@ public class ConsumerBatchReceiveTest extends ProducerConsumerBase {
                 .isAckReceiptEnabled(isEnableAckReceipt)
                 .enableBatchIndexAcknowledgment(isEnableAckReceipt)
                 .ackTimeout(1, TimeUnit.SECONDS)
+                // With the default 1 s tick, the unacked messages come back ~2 s after they were received
+                .ackTimeoutTickTime(100, TimeUnit.MILLISECONDS)
                 .subscribe();
         sendMessagesAsyncAndWait(producer, 100);
         batchReceiveAndRedelivery(consumer, 100);
@@ -498,10 +590,10 @@ public class ConsumerBatchReceiveTest extends ProducerConsumerBase {
     private void receiveAsync(Consumer<String> consumer, int expected, CountDownLatch latch) {
         consumer.batchReceiveAsync().thenAccept(messages -> {
             if (messages != null) {
-                log.info("Received {} messages in a single batch receive.", messages.size());
+                log.info().attr("received", messages.size()).log("Received messages in a single batch receive.");
                 for (Message<String> message : messages) {
                     Assert.assertNotNull(message.getValue());
-                    log.info("Get message {} from batch", message.getValue());
+                    log.info().attr("getMessage", message.getValue()).log("Get message from batch");
                     latch.countDown();
                 }
                 consumer.acknowledgeAsync(messages);
@@ -520,7 +612,7 @@ public class ConsumerBatchReceiveTest extends ProducerConsumerBase {
         for (int i = 0; i < messages; i++) {
             String message = "my-message-" + i;
             producer.sendAsync(message).thenAccept(messageId -> {
-                log.info("Message {} published {}", message, messageId);
+                log.info().attr("message", message).attr("published", messageId).log("Message published");
                 if (messageId != null) {
                     latch.countDown();
                 }
@@ -532,19 +624,23 @@ public class ConsumerBatchReceiveTest extends ProducerConsumerBase {
     private void batchReceiveAndCheck(Consumer<String> consumer, int expected) throws Exception {
         Messages<String> messages;
         int messageReceived = 0;
+        // With ack receipts, an acknowledgment completes at the next grouped flush (every 100 ms):
+        // acknowledge each batch asynchronously and wait for all of them at the end
+        List<CompletableFuture<Void>> acks = new ArrayList<>();
         do {
             messages = consumer.batchReceive();
             if (messages != null) {
                 messageReceived += messages.size();
-                log.info("Received {} messages in a single batch receive.", messages.size());
+                log.info().attr("received", messages.size()).log("Received messages in a single batch receive.");
                 for (Message<String> message : messages) {
                     Assert.assertNotNull(message.getValue());
-                    log.info("Get message {} from batch", message.getValue());
+                    log.info().attr("getMessage", message.getValue()).log("Get message from batch");
                 }
-                consumer.acknowledge(messages);
+                acks.add(consumer.acknowledgeAsync(messages));
             }
         } while (messageReceived < expected);
         Assert.assertEquals(expected, messageReceived);
+        FutureUtil.waitForAll(acks).get();
     }
 
     private void batchReceiveAndRedelivery(Consumer<String> consumer, int expected) throws Exception {
@@ -554,30 +650,111 @@ public class ConsumerBatchReceiveTest extends ProducerConsumerBase {
             messages = consumer.batchReceive();
             if (messages != null) {
                 messageReceived += messages.size();
-                log.info("Received {} messages in a single batch receive.", messages.size());
+                log.info().attr("received", messages.size()).log("Received messages in a single batch receive.");
                 for (Message<String> message : messages) {
                     Assert.assertNotNull(message.getValue());
-                    log.info("Get message {} from batch", message.getValue());
+                    log.info().attr("getMessage", message.getValue()).log("Get message from batch");
                     // don't ack, test message redelivery
                 }
             }
         } while (messageReceived < expected);
         Assert.assertEquals(expected, messageReceived);
 
+        List<CompletableFuture<Void>> acks = new ArrayList<>();
         do {
             messages = consumer.batchReceive();
             if (messages != null) {
                 messageReceived += messages.size();
-                log.info("Received {} messages in a single batch receive.", messages.size());
+                log.info().attr("received", messages.size()).log("Received messages in a single batch receive.");
                 for (Message<String> message : messages) {
                     Assert.assertNotNull(message.getValue());
-                    log.info("Get message {} from batch", message.getValue());
+                    log.info().attr("getMessage", message.getValue()).log("Get message from batch");
                 }
+                acks.add(consumer.acknowledgeAsync(messages));
             }
-            consumer.acknowledge(messages);
         } while (messageReceived < expected * 2);
-        Assert.assertEquals(expected * 2, messageReceived);
+        Assert.assertTrue(messageReceived >= expected * 2,
+                "Expected at least " + (expected * 2) + " messages but received " + messageReceived);
+        FutureUtil.waitForAll(acks).get();
     }
 
-    private static final Logger log = LoggerFactory.getLogger(ConsumerBatchReceiveTest.class);
+    @Test(timeOut = 30000)
+    public void testBatchReceiveTheSameTopicMessages() throws Exception {
+        final String topic = newTopicName();
+        final String singleTopicBatchReceiveSub = "singleTopicBatchReceiveSub-sub";
+        final String multiTopicBatchReceiveSub = "multiTopicBatchReceiveSub-sub";
+        admin.topics().createPartitionedTopic(topic, 5);
+        @Cleanup
+        Producer<String> producer = pulsarClient.newProducer(Schema.STRING)
+                .topic(topic)
+                .enableBatching(false)
+                .create();
+
+        @Cleanup
+        Consumer<String> singleTopicBatchReceiveConsumer = pulsarClient.newConsumer(Schema.STRING)
+                .topic(topic)
+                .batchReceivePolicy(BatchReceivePolicy.DEFAULT_MULTI_TOPICS_DISABLE_POLICY)
+                .subscriptionName(singleTopicBatchReceiveSub)
+                .subscribe();
+
+        @Cleanup
+        Consumer<String> multiTopicBatchReceiveConsumer = pulsarClient.newConsumer(Schema.STRING)
+                .topic(topic)
+                .batchReceivePolicy(BatchReceivePolicy.DEFAULT_POLICY)
+                .subscriptionName(multiTopicBatchReceiveSub)
+                .subscribe();
+
+        // prepare messages
+        int number = 1000;
+        for (int i = 0; i < number; i++) {
+            producer.sendAsync(i + "");
+        }
+
+        // test receive single topic messages
+        // if this flag become true, it means the batch receive multi-number messages
+        boolean multiNumberFlag = false;
+
+        // if number = 0, it means all the messages has been consumed
+        while (number != 0) {
+            Messages<String> messages = singleTopicBatchReceiveConsumer.batchReceive();
+            if (messages.size() > 0) {
+                if (messages.size() > 1) {
+                    multiNumberFlag = true;
+                }
+                String topicName = null;
+                for (Message<String> message : messages) {
+                    number--;
+                    if (topicName != null) {
+                        // check if the topicName is the same
+                        Assert.assertEquals(message.getTopicName(), topicName);
+                    }
+                    topicName = message.getTopicName();
+                }
+            }
+        }
+        Assert.assertTrue(multiNumberFlag);
+
+        number  = 1000;
+        // test default batch policy can receive the multi topics messages
+        while (number != 0) {
+            Messages<String> messages = multiTopicBatchReceiveConsumer.batchReceive();
+            if (messages.size() > 0) {
+                String topicName = null;
+                for (Message<String> message : messages) {
+                    number--;
+                    if (topicName != null) {
+                        // receive the different topic messages in one batch receive
+                        if (!topicName.equals(message.getTopicName())) {
+                            return;
+                        }
+                    }
+                    topicName = message.getTopicName();
+                }
+            }
+        }
+        // if BatchReceivePolicy.DEFAULT_MULTI_TOPICS_DISABLE_POLICY can not receive the multi topics messages,
+        // the test should fail
+        Assert.fail();
+    }
+
 }

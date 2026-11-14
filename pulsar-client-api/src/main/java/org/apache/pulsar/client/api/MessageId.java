@@ -1,4 +1,4 @@
-/**
+/*
  * Licensed to the Apache Software Foundation (ASF) under one
  * or more contributor license agreements.  See the NOTICE file
  * distributed with this work for additional information
@@ -20,13 +20,12 @@ package org.apache.pulsar.client.api;
 
 import java.io.IOException;
 import java.io.Serializable;
-
 import org.apache.pulsar.client.internal.DefaultImplementation;
 import org.apache.pulsar.common.classification.InterfaceAudience;
 import org.apache.pulsar.common.classification.InterfaceStability;
 
 /**
- * Opaque unique identifier of a single message
+ * Opaque unique identifier of a single message.
  *
  * <p>The MessageId can be used to reference a specific message, for example when acknowledging, without having
  * to retain the message content in memory for an extended period of time.
@@ -84,7 +83,8 @@ public interface MessageId extends Comparable<MessageId>, Serializable {
     /**
      * MessageId that represents the next message published in the topic.
      */
-    MessageId latest = DefaultImplementation.getDefaultImplementation().newMessageId(Long.MAX_VALUE, Long.MAX_VALUE, -1);
+    MessageId latest = DefaultImplementation.getDefaultImplementation()
+            .newMessageId(Long.MAX_VALUE, Long.MAX_VALUE, -1);
 
     // CHECKSTYLE.ON: ConstantName
 }

@@ -1,4 +1,4 @@
-/**
+/*
  * Licensed to the Apache Software Foundation (ASF) under one
  * or more contributor license agreements.  See the NOTICE file
  * distributed with this work for additional information
@@ -18,44 +18,44 @@
  */
 package org.apache.pulsar.common.policies.data;
 
+import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
-
-import org.apache.pulsar.common.policies.data.AuthPolicies;
-import org.apache.pulsar.common.policies.data.BacklogQuota;
-import org.apache.pulsar.common.policies.data.PersistencePolicies;
-
-import com.google.common.base.Objects;
-import com.google.common.collect.Lists;
-import com.google.common.collect.Maps;
+import java.util.Objects;
 
 public class OldPolicies {
-    public final AuthPolicies auth_policies;
-    public List<String> replication_clusters;
-    public Map<BacklogQuota.BacklogQuotaType, BacklogQuota> backlog_quota_map;
+    public final AuthPolicies authPolicies;
+    public List<String> replicationClusters;
+    public Map<BacklogQuota.BacklogQuotaType, BacklogQuota> backlogQuotaMap;
     public PersistencePolicies persistence;
-    public Map<String, Integer> latency_stats_sample_rate;
+    public Map<String, Integer> latencyStatsSampleRate;
 
     public OldPolicies() {
-        auth_policies = AuthPolicies.builder().build();
-        replication_clusters = Lists.newArrayList();
-        backlog_quota_map = Maps.newHashMap();
+        authPolicies = AuthPolicies.builder().build();
+        replicationClusters = new ArrayList<>();
+        backlogQuotaMap = new HashMap<>();
         persistence = null;
-        latency_stats_sample_rate = Maps.newHashMap();
+        latencyStatsSampleRate = new HashMap<>();
     }
 
     @Override
     public boolean equals(Object obj) {
         if (obj instanceof OldPolicies) {
             OldPolicies other = (OldPolicies) obj;
-            return Objects.equal(auth_policies, other.auth_policies)
-                    && Objects.equal(replication_clusters, other.replication_clusters)
-                    && Objects.equal(backlog_quota_map, other.backlog_quota_map)
-                    && Objects.equal(persistence, other.persistence)
-                    && Objects.equal(latency_stats_sample_rate, other.latency_stats_sample_rate);
+            return Objects.equals(authPolicies, other.authPolicies)
+                    && Objects.equals(replicationClusters, other.replicationClusters)
+                    && Objects.equals(backlogQuotaMap, other.backlogQuotaMap)
+                    && Objects.equals(persistence, other.persistence)
+                    && Objects.equals(latencyStatsSampleRate, other.latencyStatsSampleRate);
         }
 
         return false;
+    }
+
+    @Override
+    public int hashCode() {
+        return Objects.hash(authPolicies, replicationClusters, backlogQuotaMap, persistence, latencyStatsSampleRate);
     }
 
 }

@@ -1,4 +1,4 @@
-/**
+/*
  * Licensed to the Apache Software Foundation (ASF) under one
  * or more contributor license agreements.  See the NOTICE file
  * distributed with this work for additional information
@@ -21,7 +21,8 @@ package org.apache.pulsar.broker.transaction.buffer;
 import com.google.common.annotations.Beta;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
-import org.apache.pulsar.broker.transaction.buffer.exceptions.EndOfTransactionException;
+import org.apache.pulsar.broker.transaction.exception.buffer.TransactionBufferException.EndOfTransactionException;
+
 
 /**
  * A reader to read entries of a given transaction from transaction buffer.

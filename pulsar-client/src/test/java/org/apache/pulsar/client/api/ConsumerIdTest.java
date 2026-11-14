@@ -1,4 +1,4 @@
-/**
+/*
  * Licensed to the Apache Software Foundation (ASF) under one
  * or more contributor license agreements.  See the NOTICE file
  * distributed with this work for additional information
@@ -20,12 +20,9 @@ package org.apache.pulsar.client.api;
 
 import static org.testng.Assert.assertEquals;
 import static org.testng.Assert.assertNotEquals;
-
-import org.testng.annotations.Test;
-
-import com.google.common.base.Objects;
-
+import java.util.Objects;
 import org.apache.pulsar.client.impl.ConsumerId;
+import org.testng.annotations.Test;
 
 public class ConsumerIdTest {
     private static final String TOPIC_TEST = "my-topic-1";
@@ -47,7 +44,7 @@ public class ConsumerIdTest {
     @Test
     public void hashCodeTest() {
         ConsumerId testConsumerId = new ConsumerId(TOPIC_TEST, SUBSCRIPTION_TEST);
-        assertEquals(Objects.hashCode(TOPIC_TEST, SUBSCRIPTION_TEST), testConsumerId.hashCode());
+        assertEquals(Objects.hash(TOPIC_TEST, SUBSCRIPTION_TEST), testConsumerId.hashCode());
     }
 
     @Test
